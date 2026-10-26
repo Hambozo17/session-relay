@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from accounts import AccountManager, LOCALDATA, REAL_HOME, ACCOUNT_REFRESH_SECONDS, atomic_json, load_json, normalize_threshold
 from orca_adapter import OrcaAdapter
 from recovery_policy import recovery_error, proxy_session
+from transcript import permission_policy_equal
 
 CONFIG = LOCALDATA / 'config.json'
 STATUS = LOCALDATA / 'status.json'
@@ -104,6 +105,17 @@ def same_account_restart_eligible(sessions):
         return False
     return needs_restart
 
+def orca_resumed_context_verified(operation, session):
+    before=operation.get('orca_recovery_context',{}).get(session.get('id'))
+    if not isinstance(before,dict):return False
+    turn=session.get('turn_id')
+    old_turn=before.get('turn_id') or operation.get('originals',{}).get(session.get('id'),{}).get('turn')
+    return bool(old_turn and turn and turn!=old_turn and session.get('_context_turn_id')==turn
+        and before.get('model') and before.get('effort')
+        and session.get('model')==before['model'] and session.get('effort')==before['effort']
+        and permission_policy_equal(before,session))
+
+
 def orca_continuation_failed(operation, sessions):
     # An accepted send plus a different, verifiably failed turn is a settled
     # outcome, not an uncertain submission. Re-enter normal account selection.
@@ -130,8 +142,9 @@ def orca_continuation_failed(operation, sessions):
             or row.get('terminal')!=metadata.get('terminal') or row.get('incarnation')!=metadata.get('incarnation')
             or row.get('waiting') or row.get('is_child') or proxy_session(row)
             or row.get('goal_status') not in (None,'active','usage_limited')):return False
-    for field in ('cwd','model','effort','model_provider','approval_policy','sandbox_policy'):
+    for field in ('cwd','model','effort','model_provider'):
         if row.get(field)!=before.get(field):return False
+    if not orca_resumed_context_verified(operation,row):return False
     old_goal=before.get('_goal');new_goal=row.get('_goal')
     if old_goal is None or new_goal is None:return old_goal is None and new_goal is None
     return (all(old_goal.get(k)==new_goal.get(k) for k in ('goal_id','token_budget')) and
@@ -771,6 +784,8 @@ class Controller:
                 safe = bool(operation.get('sessions')) and all(
                     sid in rows and rows[sid].get('account_key') == operation.get('target')
                     and rows[sid].get('status') in ('running', 'idle')
+                    and not rows[sid].get('waiting') and not rows[sid].get('is_child') and not proxy_session(rows[sid])
+                    and orca_resumed_context_verified(operation,rows[sid])
                     and rows[sid].get('connected') and (sid in operation.get('recovered_sessions',[])
                         or rows[sid].get('terminal') != (operation.get('originals',{}).get(sid,{}).get('terminal') or metadata.get('terminal'))
                         or (operation.get('originals',{}).get(sid,{}).get('turn') and rows[sid].get('turn_id') != operation['originals'][sid]['turn']))

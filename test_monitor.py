@@ -27,6 +27,54 @@ class Adapter:
     def discover(self): return self.rows
 
 class Monitor(unittest.TestCase):
+    def test_orca_reconciliation_keeps_unverified_resumed_turns_blocked_across_restart(self):
+        original={'id':'chat','turn_id':'before','model':'chosen','effort':'high',
+            'approval_policy':'never','sandbox_policy':{'type':'danger-full-access'},
+            'permission_profile':{'type':'disabled'},'cwd':'C:/work','_goal':None}
+        invalid=[{'_context_turn_id':None},{'_context_turn_id':'before'},
+            {'model':'changed'},{'effort':'low'},{'approval_policy':'on-request'},
+            {'sandbox_policy':{'type':'read-only'}},
+            {'permission_profile':{'type':'external'}}]
+        for status in ('running','failed'):
+            for changed in invalid:
+                with self.subTest(status=status,changed=changed), tempfile.TemporaryDirectory() as folder:
+                    root=pathlib.Path(folder);(root/'operations').mkdir()
+                    operation={'id':'orca-resume','app':'orca','state':'needs-attention',
+                        'phase':'continuation-accepted','sessions':['chat'],'target':'active',
+                        'originals':{'chat':{'turn':'before','terminal':'old-pane'}},
+                        'metadata':{'session':'chat','turn':'before','terminal':'new-pane','incarnation':'new-inc'},
+                        'orca_recovery_context':{'chat':original},
+                        'target_quota':{'allowance_generation':0}}
+                    path=root/'operations/orca-resume.json'
+                    path.write_text(json.dumps(operation))
+                    row=dict(original,status=status,turn_id='after',_context_turn_id='after',
+                        error_kind='quota' if status=='failed' else None,provider='codex',
+                        account_key='active',connected=True,supported=True,home='C:/active',
+                        terminal='new-pane',incarnation='new-inc',waiting=False,is_child=False)
+                    row.update(changed)
+                    cfg={'orca':{'enabled':True,'sessions':['chat']},'codex':{'enabled':False}}
+                    with patch.object(controller,'LOCALDATA',root),patch.object(controller,'STATUS',root/'status.json'),patch.object(controller,'JOURNAL',root/'journal.json'),patch.object(controller,'config',return_value=cfg):
+                        adapters={'orca':Adapter([row]),'codex':Adapter([])}
+                        current=controller.Controller(Accounts(),adapters);current.refresh_started=time.time()
+                        try:
+                            for _ in range(2):
+                                current.cycle()
+                                self.assertEqual(len(current.unresolved),1)
+                                self.assertEqual(json.loads(path.read_text())['state'],'needs-attention')
+                        finally:current.refresh_pool.shutdown(wait=True)
+                        restarted=controller.Controller(Accounts(),adapters);restarted.refresh_started=time.time()
+                        try:
+                            restarted.cycle()
+                            self.assertEqual(len(restarted.unresolved),1)
+                            self.assertIn('orca',restarted.attention)
+                            row.update(original,turn_id='after',_context_turn_id='after')
+                            restarted.cycle()
+                            self.assertFalse(restarted.unresolved)
+                            self.assertNotIn('orca',restarted.attention)
+                            expected='reconciled-after-quota-failure' if status=='failed' else 'reconciled-before-continuation'
+                            self.assertEqual(json.loads(path.read_text())['state'],expected)
+                        finally:restarted.refresh_pool.shutdown(wait=True)
+
     def test_completed_later_turn_retires_failed_quit_without_resuming_idle_chat(self):
         operation={'phase':'desktop-close-intent','outgoing':'old','target':'new','sessions':['chat'],'updated_at':10,
             'recovery_context':{'chat':{'turn':'old-turn','settings':'same','goal_record':{'status':'usage_limited'}}}}

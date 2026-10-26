@@ -393,16 +393,20 @@ class QuotaLoop(unittest.TestCase):
             finally:c._health_stop.set();health.join(timeout=3)
 
     def test_accepted_continuation_failure_can_retry_but_uncertain_send_stays_blocked(self):
-        before={'model':'chosen','effort':'xhigh','cwd':'repo','_goal':None}
+        before={'model':'chosen','effort':'xhigh','cwd':'repo','_goal':None,'turn_id':'old',
+            'approval_policy':'never','sandbox_policy':{'type':'danger-full-access'},
+            'permission_profile':{'type':'disabled'}}
         op={'app':'orca','phase':'continuation-accepted','target':'only','sessions':['chat'],
             'metadata':{'session':'chat','terminal':'pane','incarnation':'inc','turn':'old'},
             'orca_recovery_context':{'chat':before}}
         row=dict(before,id='chat',account_key='only',status='failed',error_kind='quota',
-            turn_id='new',connected=True,terminal='pane',incarnation='inc')
+            turn_id='new',_context_turn_id='new',connected=True,terminal='pane',incarnation='inc')
         self.assertTrue(controller.orca_continuation_failed(op,[row]))
         self.assertFalse(controller.orca_continuation_failed(dict(op,phase='send-continuation'),[row]))
         for changes in ({'status':'interrupted'},{'waiting':True},{'turn_id':'old'},
-                {'model':'other'},{'account_key':'other'},{'incarnation':'other'}):
+                {'model':'other'},{'account_key':'other'},{'incarnation':'other'},
+                {'_context_turn_id':None},{'_context_turn_id':'old'},
+                {'approval_policy':'on-request'},{'sandbox_policy':{'type':'read-only'}}):
             self.assertFalse(controller.orca_continuation_failed(op,[dict(row,**changes)]),changes)
         sibling=dict(before,id='sibling',turn_id='untouched',account_key='old',terminal='sibling-pane',incarnation='inc')
         batch=dict(op,sessions=['chat','sibling'],orca_recovery_context={'chat':before,'sibling':sibling})
