@@ -49,6 +49,29 @@ class Adapter:
     def resume_in_place(self,ids,journal):self.rotate(ids,{'key':'only'},journal)
 
 
+class CodexGoalAdapter:
+    def __init__(self, row):
+        self.rows=[row]
+        self.calls=[]
+        self.recovery_receipts={}
+
+    def discover(self):return self.rows
+
+    def rotate(self, ids, target, journal, **_kwargs):
+        self.calls.append(('rotate',list(ids),target['key']))
+        for row in self.rows:
+            if row['id'] not in ids:continue
+            goal=dict(row['_goal_record'])
+            context={'turn':row['turn_id'],'settings':row['_settings_fingerprint'],
+                'settings_snapshot':row.get('_settings'),'goal_record':dict(goal)}
+            journal('desktop-recovery-context',{'context':{row['id']:context}})
+            goal.update(status='usage_limited',tokens_used=goal['tokens_used']+1,
+                time_used_seconds=goal['time_used_seconds']+1)
+            row.update(status='idle',error_kind=None,goal_status='usage_limited',
+                turn_id=f"{target['key']}-turn-{len(self.calls)}",account_key=target['key'],
+                _goal_record=goal,_turn_started_at_ms=int((time.time()+1)*1000))
+
+
 class QuotaLoop(unittest.TestCase):
     @contextlib.contextmanager
     def environment(self,app):
@@ -193,16 +216,15 @@ class QuotaLoop(unittest.TestCase):
             finally:
                 restarted.refresh_pool.shutdown(wait=True)
 
-    def test_orca_completed_target_failures_are_persisted_and_block_bounces_until_reset(self):
+
+    def test_codex_idle_usage_limited_handoffs_block_bounces_until_each_target_resets(self):
         with tempfile.TemporaryDirectory() as folder,contextlib.ExitStack() as stack:
-            root=pathlib.Path(folder);now=time.time()
+            root=pathlib.Path(folder)
             class MultiAccounts:
                 def __init__(self):
-                    self.records=[
-                        {'key':'A','home':str(root/'A'),'orca_home':str(root/'A'),'orca_id':'native-A','label':'A','sources':['Orca']},
-                        {'key':'B','home':str(root/'B'),'orca_home':str(root/'B'),'orca_id':'native-B','label':'B','sources':['Orca']},
-                    ]
-                    self.quotas={'A':self.quota(),'B':self.quota()}
+                    self.records=[{'key':key,'home':str(root/key),'label':key,'sources':['Codex']}
+                        for key in ('A','B')]
+                    self.quotas={key:self.quota() for key in ('A','B')}
                 def quota(self,generation=0):
                     return {'valid':True,'plan':'plus','ordinary_allowed':True,'five_remaining':80,
                         'weekly_remaining':70,'updated_at':time.time(),'reset_at':None,
@@ -212,53 +234,99 @@ class QuotaLoop(unittest.TestCase):
                 def current_desktop_key(self):return None
                 def probe(self,record,force=False,home=None):return self.quotas[record['key']]
             accounts=MultiAccounts()
-            settings={'cwd':'C:/project','model':'gpt-test','effort':'high','model_provider':'openai',
-                'approval_policy':'on-request','sandbox_policy':{'type':'workspaceWrite'}}
-            row={'id':'chat','status':'failed','error_kind':'quota','turn_id':'turn-B-failure',
-                '_turn_started_at_ms':int(now*1000),'account_key':'B','home':str(root/'B'),
-                'connected':True,'supported':True,'provider':'codex','terminal':'terminal-B',
-                'incarnation':'inc-B','pty_id':'pty-B',**settings}
-            op_b={'id':'completed-A-to-B','app':'orca','state':'complete','outgoing':'A','target':'B',
-                'sessions':['chat'],'started_at':now-20,'updated_at':now-10,
-                'target_quota':{'allowance_generation':0,'reset_at':None,'weekly_reset_at':None},
-                'orca_recovery_context':{'chat':dict(row,turn_id='turn-before-B',status='running',
-                    account_key='A')},
-                'orca_target_panes':{'chat':{'target':'B','terminal':'terminal-B','incarnation':'inc-B','pty_id':'pty-B'}}}
-            operations=root/'operations';operations.mkdir()
-            (operations/'completed-A-to-B.json').write_text(json.dumps(op_b),encoding='utf-8')
-            journal_path=root/'journal.json';journal_path.write_text(json.dumps(op_b),encoding='utf-8')
-            cfg={'threshold':2,'included_resets':False,'orca':{'enabled':True,'sessions':['chat']},
-                'codex':{'enabled':False,'sessions':[]}}
-            for name,value in [('LOCALDATA',root),('STATUS',root/'status.json'),('JOURNAL',journal_path)]:
+            goal={'goal_id':'goal-1','status':'active','token_budget':100,'tokens_used':40,
+                'time_used_seconds':30,'created_at_ms':100,'deferred':False}
+            row={'id':'chat','status':'failed','error_kind':'quota','goal_status':'active',
+                'turn_id':'initial-A','_turn_started_at_ms':int((time.time()-10)*1000),
+                'account_key':'A','provider':'codex','model_provider':'openai','model':'gpt-test',
+                'effort':'high','_owner':'owner-1','_settings_fingerprint':'settings-1',
+                '_settings':{'model':'gpt-test','effort':'high'},'_goal_record':goal,
+                '_goal_deferred':False,'_goal_mismatch':False,'_ephemeral':False,
+                'waiting':False,'is_child':False,'supported':True}
+            cfg={'threshold':2,'included_resets':False,
+                'codex':{'enabled':True,'sessions':['chat']},
+                'orca':{'enabled':False,'sessions':[]}}
+            for name,value in [('LOCALDATA',root),('STATUS',root/'status.json'),('JOURNAL',root/'journal.json')]:
                 stack.enter_context(patch.object(controller,name,value))
             stack.enter_context(patch.object(controller,'config',return_value=cfg))
-            adapter=Adapter([row],'orca');other=Adapter([],'codex')
-            first=controller.Controller(accounts,{'orca':adapter,'codex':other});first.refresh_started=time.time()
+            adapter=CodexGoalAdapter(row);other=Adapter([],'orca')
+            first=controller.Controller(accounts,{'codex':adapter,'orca':other})
+            first.refresh_started=time.time()
             try:
-                self.assertEqual(controller.quota_failed_target_keys('orca',[row],first.recovery_attempts,accounts.quotas),set())
                 first.cycle()
-                self.assertEqual(adapter.calls,[('rotate',['chat'],'A')])
-                saved_b=json.loads((operations/'completed-A-to-B.json').read_text(encoding='utf-8'))
-                self.assertEqual(saved_b['state'],'complete')
-                self.assertEqual(saved_b['quota_failed_sessions']['chat']['turn'],'turn-B-failure')
+                self.assertEqual(adapter.calls,[('rotate',['chat'],'B')])
+                completed_b=next(op for op in first.completed_handoffs if op.get('target')=='B')
+                self.assertEqual(row['status'],'idle')
+                self.assertEqual(row['goal_status'],'usage_limited')
+                receipt=controller.quota_failure_after_handoff(row,completed_b)
+                self.assertEqual(receipt['error_kind'],'quota')
 
-                completed_a=max((op for op in first.recovery_attempts if op.get('target')=='A'),
-                    key=lambda op:op.get('started_at',0))
-                row.update(status='failed',error_kind='quota',turn_id='turn-A-failure',
-                    _turn_started_at_ms=int((completed_a['started_at']+5)*1000))
+                rejects=[
+                    ('old turn',dict(row,turn_id=completed_b['recovery_context']['chat']['turn'])),
+                    ('manual or unverified provider',dict(row,provider=None)),
+                    ('approval pending',dict(row,waiting=True)),
+                    ('child',dict(row,is_child=True)),
+                    ('proxy provider',dict(row,model_provider='google-antigravity')),
+                    ('paused goal',dict(row,goal_status='paused')),
+                    ('completed goal',dict(row,goal_status='complete')),
+                    ('budget limited goal',dict(row,goal_status='budget_limited')),
+                    ('deferred goal flag',dict(row,_goal_deferred=True)),
+                    ('ephemeral',dict(row,_ephemeral=True)),
+                    ('mismatched goal flag',dict(row,_goal_mismatch=True)),
+                    ('settings changed',dict(row,_settings_fingerprint='other-settings')),
+                    ('owner missing',dict(row,_owner=None)),
+                    ('post-handoff timestamp missing',dict(row,_turn_started_at_ms=None)),
+                    ('turn predates handoff',dict(row,_turn_started_at_ms=int(completed_b['started_at']*1000))),
+                    ('native goal missing',dict(row,_goal_record=None)),
+                    ('goal identity changed',dict(row,_goal_record=dict(row['_goal_record'],goal_id='other'))),
+                    ('goal budget changed',dict(row,_goal_record=dict(row['_goal_record'],token_budget=101))),
+                    ('goal progress regressed',dict(row,_goal_record=dict(row['_goal_record'],tokens_used=39))),
+                ]
+                for label,bad_row in rejects:
+                    self.assertIsNone(controller.quota_failure_after_handoff(bad_row,completed_b),label)
+                missing_id_before=dict(completed_b['recovery_context']['chat'])
+                missing_id_before['goal_record']=dict(
+                    missing_id_before['goal_record'],goal_id='')
+                missing_id_operation=dict(completed_b,recovery_context=dict(
+                    completed_b['recovery_context'],chat=missing_id_before))
+                missing_id_row=dict(row,_goal_record=dict(row['_goal_record'],goal_id=''))
+                self.assertIsNone(controller.quota_failure_after_handoff(
+                    missing_id_row,missing_id_operation),'missing native Goal ID')
+                self.assertIsNone(controller.quota_failure_after_handoff(
+                    row,dict(completed_b,state='in-progress')),'handoff is not complete')
+                self.assertIsNone(controller.quota_failure_after_handoff(
+                    row,dict(completed_b,recovery_context={})), 'manual turn without native recovery context')
+                self.assertIsNone(controller.quota_failure_after_handoff(
+                    row,dict(completed_b,app='orca')), 'Orca idle Goal')
+
                 first.cycle()
-                self.assertEqual(len(adapter.calls),1)
-                self.assertEqual(controller.quota_failed_target_keys('orca',[row],first.recovery_attempts,accounts.quotas),{'A','B'})
+                self.assertEqual(adapter.calls,[('rotate',['chat'],'B'),('rotate',['chat'],'A')])
+                self.assertEqual(row['account_key'],'A')
+                first.cycle()
+                self.assertEqual(len(adapter.calls),2)
             finally:
                 first.refresh_pool.shutdown(wait=True)
 
-            restarted=controller.Controller(accounts,{'orca':adapter,'codex':other});restarted.refresh_started=time.time()
+            saved=[json.loads(path.read_text(encoding='utf-8'))
+                for path in (root/'operations').glob('*.json')]
+            receipts={op['target']:op['quota_failed_sessions']['chat'] for op in saved
+                if op.get('state')=='complete' and op.get('quota_failed_sessions',{}).get('chat')}
+            self.assertEqual(set(receipts),{'A','B'})
+            self.assertEqual(receipts['A']['target_quota']['allowance_generation'],0)
+            self.assertEqual(receipts['B']['target_quota']['allowance_generation'],0)
+
+            restarted=controller.Controller(accounts,{'codex':adapter,'orca':other})
+            restarted.refresh_started=time.time()
             try:
                 restarted.cycle()
-                self.assertEqual(len(adapter.calls),1)
+                self.assertEqual(len(adapter.calls),2)
+                self.assertEqual(controller.quota_failed_target_keys(
+                    'codex',[row],restarted.recovery_attempts,accounts.quotas),{'A','B'})
                 accounts.quotas['B']=accounts.quota(generation=1)
                 restarted.cycle()
                 self.assertEqual(adapter.calls[-1],('rotate',['chat'],'B'))
+                self.assertEqual(controller.quota_failed_target_keys(
+                    'codex',[row],restarted.recovery_attempts,accounts.quotas),{'A'})
             finally:
                 restarted.refresh_pool.shutdown(wait=True)
 

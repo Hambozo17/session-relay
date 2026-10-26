@@ -215,51 +215,124 @@ def quota_windows(raw, weekly_fallback=False):
     return result
 
 
-def _quota_capacity_state(quota):
-    """Return depleted/usable only for a complete, verified supported quota."""
+def normalize_threshold(value=2):
+    """Normalize the user recovery threshold to the monitor's supported range."""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 2.0
+    if not math.isfinite(threshold):
+        return 2.0
+    return max(0.0, min(20.0, threshold))
+
+
+def _quota_values_complete(quota):
     if not isinstance(quota, dict) or quota.get('valid') is not True:
-        return None
+        return False
     weekly = quota.get('weekly_remaining')
     if not isinstance(weekly, (int, float)) or isinstance(weekly, bool) or not math.isfinite(weekly):
+        return False
+    if quota.get('weekly_only') is True:
+        return True
+    five = quota.get('five_remaining')
+    return (isinstance(five, (int, float)) and not isinstance(five, bool)
+        and math.isfinite(five))
+
+
+def _quota_capacity_state(quota, threshold=2):
+    """Return depleted/usable only for a complete, verified supported quota."""
+    if not _quota_values_complete(quota):
         return None
-    if weekly <= 0:
+    threshold = normalize_threshold(threshold)
+    weekly = quota.get('weekly_remaining')
+    if weekly <= threshold:
         return 'depleted'
     weekly_only=quota.get('weekly_only') is True
     if not weekly_only:
         five = quota.get('five_remaining')
-        if not isinstance(five, (int, float)) or isinstance(five, bool) or not math.isfinite(five):
-            return None
-        if five <= 0:
+        if five <= threshold:
             return 'depleted'
     if quota.get('ordinary_allowed', True) is not True or str(quota.get('plan', '')).lower() == 'free':
         return None
     return 'usable'
 
 
-def _carry_allowance_generation(previous, result):
+def _carry_allowance_generation(previous, result, threshold=2):
     """Add durable reset evidence without changing quota fields on failure."""
     previous = previous if isinstance(previous, dict) else {}
     result = dict(result)
+    threshold = normalize_threshold(threshold)
     generation = previous.get('_allowance_generation', 0)
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
         generation = 0
     depleted = previous.get('_allowance_depleted')
+    armed_threshold = previous.get('_allowance_depleted_threshold')
+    if isinstance(armed_threshold, (int, float)) and not isinstance(armed_threshold, bool) and math.isfinite(armed_threshold):
+        armed_threshold = normalize_threshold(armed_threshold)
+    else:
+        armed_threshold = None
+    legacy_zero_proof = depleted is True and armed_threshold is None
+    if legacy_zero_proof:
+        armed_threshold = 0.0
+    previous_state = _quota_capacity_state(previous, threshold)
+    previous_complete = _quota_values_complete(previous)
+
     if not isinstance(depleted, bool):
         # Older quota-cache entries have no generation metadata. Reconstruct
         # only a verified depleted state; invalid and partial records stay unknown.
-        previous_state = _quota_capacity_state(previous)
         depleted = True if previous_state == 'depleted' else False if previous_state == 'usable' else None
+        armed_threshold = threshold if depleted is True else None
+    elif previous_complete:
+        # Re-evaluate complete cached usage at the current threshold. This keeps
+        # a settings change from looking like a quota reset in either direction.
+        if previous_state == 'depleted':
+            depleted = True
+            if not legacy_zero_proof:
+                armed_threshold = threshold
+        elif previous_state == 'usable':
+            depleted = False
+            armed_threshold = None
+        elif armed_threshold != threshold and not legacy_zero_proof:
+            # A complete but unclassifiable record (for example, ordinary use
+            # blocked above threshold) cannot safely carry a proof across a
+            # threshold change.
+            depleted = None
+            armed_threshold = None
+    elif depleted is True:
+        if legacy_zero_proof:
+            # Before threshold metadata existed, a true flag could only have
+            # been armed by a literal zero and is valid at every supported
+            # threshold, including when the latest probe is invalid.
+            armed_threshold = 0.0
+        elif armed_threshold is None or armed_threshold > threshold:
+            depleted = None
+            armed_threshold = None
 
-    state = _quota_capacity_state(result)
+    state = _quota_capacity_state(result, threshold)
     if state == 'depleted':
         depleted = True
+        armed_threshold = threshold
     elif state == 'usable':
         if depleted:
             generation += 1
         depleted = False
+        armed_threshold = None
     result['_allowance_generation'] = generation
     result['_allowance_depleted'] = depleted
+    if depleted is True:
+        result['_allowance_depleted_threshold'] = armed_threshold
+    else:
+        result.pop('_allowance_depleted_threshold', None)
     return result
+
+
+def _configured_threshold():
+    try:
+        saved = load_json(LOCALDATA / 'config.json')
+        value = saved.get('threshold', 2) if isinstance(saved, dict) else 2
+    except (OSError, ValueError, TypeError):
+        value = 2
+    return normalize_threshold(value)
 
 class AccountManager:
     def __init__(self, rpc=None):
@@ -363,7 +436,7 @@ class AccountManager:
         with self.lock:
             if previous is None:
                 previous = self.quotas.get(key)
-            result = _carry_allowance_generation(previous, result)
+            result = _carry_allowance_generation(previous, result, _configured_threshold())
             self.quotas[key] = result
             atomic_json(LOCALDATA / 'quota-cache.json', self.quotas)
             return result

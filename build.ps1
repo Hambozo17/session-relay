@@ -11,6 +11,22 @@ function Assert-PathWithinRoot([string]$Root, [string]$Target) {
         throw "Build output path escapes the intended directory: $targetPath"
     }
 }
+function Invoke-FrozenCheck([string]$Executable, [string]$Option) {
+    # Windowed executables need an explicit wait for a reliable exit code.
+    $checkId = [Guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $buildRoot ($checkId + '.stdout')
+    $stderrPath = Join-Path $buildRoot ($checkId + '.stderr')
+    try {
+        $process = Start-Process -FilePath $Executable -ArgumentList $Option -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
+        if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
+        if ($process.ExitCode -ne 0) { throw "Frozen executable failed $Option with exit code $($process.ExitCode)." }
+    } finally {
+        foreach ($path in @($stdoutPath, $stderrPath)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
+        }
+    }
+}
 foreach ($path in @($buildRoot, $distRoot)) {
     Assert-PathWithinRoot $workspace $path
 }
@@ -81,10 +97,8 @@ if (-not (Test-Path -LiteralPath $frozenExe -PathType Leaf)) { throw "PyInstalle
 if (-not (Test-Path -LiteralPath (Join-Path $frozenApp '_internal\node.exe') -PathType Leaf)) {
     throw 'PyInstaller output is missing bundled _internal\node.exe.'
 }
-& $frozenExe --version
-if ($LASTEXITCODE -ne 0) { throw 'The built executable failed --version.' }
-& $frozenExe --smoke-test
-if ($LASTEXITCODE -ne 0) { throw 'The built executable failed --smoke-test.' }
+Invoke-FrozenCheck $frozenExe '--version'
+Invoke-FrozenCheck $frozenExe '--smoke-test'
 
 Get-ChildItem -LiteralPath $frozenApp -Force | Copy-Item -Destination $bundleRoot -Recurse -Force
 foreach ($file in @('install-bundle.ps1', 'Install.cmd', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
@@ -188,10 +202,8 @@ if (-not (Test-Path -LiteralPath $extractedExe -PathType Leaf) -or
     -not (Test-Path -LiteralPath (Join-Path $extractedRoot '_internal\node.exe') -PathType Leaf)) {
     throw 'Archive verification failed: the EXE, adjacent installer, or bundled Node.js is missing.'
 }
-& $extractedExe --version
-if ($LASTEXITCODE -ne 0) { throw 'The extracted EXE failed --version.' }
-& $extractedExe --smoke-test
-if ($LASTEXITCODE -ne 0) { throw 'The extracted EXE failed --smoke-test.' }
+Invoke-FrozenCheck $extractedExe '--version'
+Invoke-FrozenCheck $extractedExe '--smoke-test'
 $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath $checksumPath -Value ($hash + '  SessionRelay-Windows-x64.zip') -Encoding Ascii
 Write-Output "Created $zipPath"

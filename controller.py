@@ -1,7 +1,7 @@
 from __future__ import annotations
-import ctypes, hashlib, json, os, pathlib, threading, time, traceback, uuid
+import ctypes, hashlib, json, math, os, pathlib, threading, time, traceback, uuid
 from concurrent.futures import ThreadPoolExecutor
-from accounts import AccountManager, LOCALDATA, REAL_HOME, ACCOUNT_REFRESH_SECONDS, atomic_json, load_json
+from accounts import AccountManager, LOCALDATA, REAL_HOME, ACCOUNT_REFRESH_SECONDS, atomic_json, load_json, normalize_threshold
 from orca_adapter import OrcaAdapter
 from recovery_policy import recovery_error, proxy_session
 
@@ -222,15 +222,22 @@ def quota_failure_before_handoff(session, operations):
 def quota_failure_after_handoff(session, operation):
     """Identify a later native quota/login failure on a completed account attempt."""
     app=operation.get('app')
+    idle_usage_goal=(app=='codex' and session.get('status')=='idle'
+        and session.get('goal_status')=='usage_limited')
     if (app not in ('codex','orca') or operation.get('state')!='complete'
             or session.get('id') not in operation.get('sessions',[])
             or session.get('provider') not in (None,'codex')
-            or session.get('status')!='failed' or not recovery_error(session.get('error_kind'))
+            or (not idle_usage_goal and (session.get('status')!='failed' or not recovery_error(session.get('error_kind'))))
             or session.get('account_key')!=operation.get('target')
             or session.get('waiting') or session.get('is_child') or proxy_session(session)
             or session.get('goal_status') not in (None,'active','usage_limited')
             or not session.get('turn_id')):
         return None
+    if idle_usage_goal:
+        kind=''.join(c for c in str(session.get('error_kind') or '').lower() if c.isalnum())
+        if (session.get('provider')!='codex' or kind not in ('','quota','usagelimitexceeded','ratelimitexceeded')
+                or session.get('_goal_deferred') or session.get('_goal_mismatch') or session.get('_ephemeral')):
+            return None
     sid=session['id']
     if app=='orca' and session.get('_screen_quota'):
         return None  # Supplemental screen text has no native turn-bound error receipt.
@@ -243,6 +250,28 @@ def quota_failure_after_handoff(session, operation):
         settings=before.get('settings') or before.get('_settings_fingerprint')
         if not settings or session.get('_settings_fingerprint')!=settings or not session.get('_owner'):
             return None
+        if idle_usage_goal:
+            before_goal=before.get('goal_record')
+            after_goal=session.get('_goal_record')
+            if (not isinstance(before_goal,dict) or not isinstance(after_goal,dict)
+                    or after_goal.get('status')!='usage_limited'
+                    or before_goal.get('deferred') or after_goal.get('deferred')):
+                return None
+            for goal in (before_goal,after_goal):
+                goal_id=goal.get('goal_id')
+                if not isinstance(goal_id,str) or not goal_id.strip():
+                    return None
+                for field in ('token_budget','tokens_used','time_used_seconds'):
+                    value=goal.get(field)
+                    if (not isinstance(value,(int,float)) or isinstance(value,bool)
+                            or not math.isfinite(value)):
+                        return None
+            comparable_goal=dict(before_goal)
+            if comparable_goal.get('status')=='active':
+                comparable_goal['status']='usage_limited'
+            from desktop_adapter import DesktopAdapter
+            if not DesktopAdapter._goal_progress_preserved(comparable_goal,after_goal):
+                return None
         pane_receipt={}
     else:
         fields=('cwd','model','effort','model_provider','approval_policy','sandbox_policy')
@@ -262,6 +291,11 @@ def quota_failure_after_handoff(session, operation):
         pane_receipt={key:session.get(key) for key in ('terminal','incarnation','pty_id','account_key')}
     started=session.get('_turn_started_at_ms')
     handoff_at=operation.get('started_at',operation.get('updated_at'))
+    if idle_usage_goal and (not isinstance(started,(int,float)) or isinstance(started,bool)
+            or not math.isfinite(started) or not isinstance(handoff_at,(int,float))
+            or isinstance(handoff_at,bool) or not math.isfinite(handoff_at)
+            or started<=handoff_at*1000):
+        return None
     if (isinstance(started,(int,float)) and isinstance(handoff_at,(int,float))
             and started<=handoff_at*1000):
         return None
@@ -270,7 +304,7 @@ def quota_failure_after_handoff(session, operation):
         return None
     return {
         'turn':session['turn_id'],
-        'error_kind':session.get('error_kind'),
+        'error_kind':session.get('error_kind') or ('quota' if idle_usage_goal else None),
         'settings':settings,
         'pane':pane_receipt,
         'turn_started_at_ms':started,
@@ -644,8 +678,7 @@ class Controller:
         self.cycle_started=time.time()
         self.stage='reading configuration'
         cfg = config()
-        try: threshold = max(0, min(20, float(cfg.get('threshold', 2))))
-        except (ValueError, TypeError): threshold = 2
+        threshold = normalize_threshold(cfg.get('threshold', 2))
         if time.time() - self.last_inventory > ACCOUNT_REFRESH_SECONDS:
             self.stage='reading saved accounts'
             self.accounts.inventory(); self.last_inventory = time.time()
@@ -720,13 +753,13 @@ class Controller:
                         self.stage='checking delayed recovery allowance'
                         quota=(self.accounts.probe_desktop(target,force=True) if hasattr(self.accounts,'probe_desktop')
                                else self.accounts.probe(target,force=True,home=REAL_HOME))
-                        if quota.get('valid') and any(isinstance(quota.get(k),(int,float)) and quota[k]<=cfg.get('threshold',2) for k in ('five_remaining','weekly_remaining')):
+                        if quota.get('valid') and any(isinstance(quota.get(k),(int,float)) and quota[k]<=threshold for k in ('five_remaining','weekly_remaining')):
                             for row in rows:
                                 if row['id'] in pending and row.get('status')=='interrupted':
                                     self.adapters[app].recovery_receipts[row['id']]=(row['turn_id'],row['_settings_fingerprint'])
                             safe=True
                             self.note('Codex: the verified restart account is depleted; checking another saved account.')
-                        if available(quota,cfg.get('threshold',2)):
+                        if available(quota,threshold):
                             # This phase proves no continuation was submitted. Record
                             # the submission intent durably before the native send.
                             self.journal=operation;operation['state']='in-progress';self.save_journal()
