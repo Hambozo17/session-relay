@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, ctypes, hashlib, json, math, os, pathlib, queue, sqlite3, subprocess, threading, time, tomllib, uuid
+import base64, ctypes, hashlib, json, math, os, pathlib, queue, shutil, sqlite3, subprocess, threading, time, tomllib, uuid
 from ctypes import wintypes
 from contextlib import contextmanager
 from local_rpc import HIDDEN, OrcaRpc
@@ -122,6 +122,9 @@ def codex_binary():
         return str(root)
     candidates = list((LOCALDATA.parent / 'OpenAI/Codex/bin').glob('*/codex.exe'))
     if not candidates:
+        executable = shutil.which('codex.exe')
+        if executable:
+            return executable
         raise RuntimeError('Codex CLI executable is missing')
     return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
