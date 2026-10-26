@@ -1,6 +1,7 @@
 import pathlib
 import tempfile
 import unittest
+from contextlib import closing
 
 from desktop_adapter import (
     DesktopAdapter,
@@ -165,7 +166,7 @@ class DesktopAdapterTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _write_goal(self, status):
+    def _write_goal(self, status, budget=1000):
         path = self.home / "goals_1.sqlite"
         if path.exists():
             path.unlink()
@@ -174,7 +175,7 @@ class DesktopAdapterTests(unittest.TestCase):
         db.execute("CREATE TABLE thread_goal_continuation_deferrals (thread_id TEXT PRIMARY KEY)")
         if status is not None:
             db.execute("INSERT INTO thread_goals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (THREAD, "goal-1", "private objective", status, 1000, 73, 12, 1, 2))
+                       (THREAD, "goal-1", "private objective", status, budget, 73, 12, 1, 2))
         db.commit()
         db.close()
 
@@ -414,6 +415,24 @@ class DesktopAdapterTests(unittest.TestCase):
         row=db.execute('SELECT goal_id,status,token_budget,tokens_used,time_used_seconds FROM thread_goals WHERE thread_id=?',(THREAD,)).fetchone()
         db.close()
         self.assertEqual(row,('goal-1','active',1000,73,12))
+
+    def test_same_account_unlimited_usage_goal_resumes_without_changing_its_budget(self):
+        self._write_goal('usage_limited', budget=None)
+        first = FakeBridge([make_row(status='idle', runtime_status='idle',
+            goal_status='usage_limited', error_kind='usageLimitExceeded')])
+        reopened = FakeBridge([make_row(status='running', runtime_status='active',
+            turn_id='automatic-unlimited-goal', goal_status='active')])
+        adapter, accounts, app = self._adapter(first, bridges=[reopened])
+        recovered = adapter.rotate([THREAD], accounts.find(OLD_KEY), lambda *_: None,
+            same_account_recovery=True, same_account_recovery_ids=[THREAD])
+        self.assertEqual(recovered, [THREAD])
+        self.assertEqual(accounts.activations, 0)
+        self.assertEqual((app.closed, app.launched), (1, 1))
+        self.assertFalse(any(call['op'] == 'resume' for call in reopened.calls))
+        with closing(__import__('sqlite3').connect(self.home / 'goals_1.sqlite')) as db:
+            saved = db.execute('SELECT goal_id,status,token_budget,tokens_used,time_used_seconds '
+                'FROM thread_goals WHERE thread_id=?', (THREAD,)).fetchone()
+        self.assertEqual(saved, ('goal-1', 'active', None, 73, 12))
 
     def test_same_account_restart_accepts_fast_verified_goal_completion_without_resuming(self):
         for goal_status in ('complete','completed'):

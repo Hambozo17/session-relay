@@ -27,6 +27,8 @@ Manual stops, approval requests, paused/completed Goals, independent Goal budget
 
 Orca recovery uses its local authenticated runtime and original terminal pane. Codex Desktop recovery may need a normal application restart; it checks other running conversations and approvals first. Both integrations depend on the installed applications' local protocols. An incompatible or unverifiable protocol stops recovery with a status message.
 
+Unsupported source permission policies stop recovery before the original chat is interrupted. Supported Orca sandbox restrictions are set explicitly during resume and checked against the new turn's recorded settings.
+
 Optional included usage resets are **disabled by default**. They require fresh checks confirming zero weekly allowance on every saved account. Five-hour exhaustion alone never authorizes a reset. No paid credits are purchased.
 
 ## Privacy

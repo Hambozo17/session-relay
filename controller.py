@@ -257,19 +257,12 @@ def quota_failure_after_handoff(session, operation):
                     or after_goal.get('status')!='usage_limited'
                     or before_goal.get('deferred') or after_goal.get('deferred')):
                 return None
-            for goal in (before_goal,after_goal):
-                goal_id=goal.get('goal_id')
-                if not isinstance(goal_id,str) or not goal_id.strip():
-                    return None
-                for field in ('token_budget','tokens_used','time_used_seconds'):
-                    value=goal.get(field)
-                    if (not isinstance(value,(int,float)) or isinstance(value,bool)
-                            or not math.isfinite(value)):
-                        return None
+            from desktop_adapter import DesktopAdapter
+            if not all(DesktopAdapter._goal_accounting_valid(goal) for goal in (before_goal,after_goal)):
+                return None
             comparable_goal=dict(before_goal)
             if comparable_goal.get('status')=='active':
                 comparable_goal['status']='usage_limited'
-            from desktop_adapter import DesktopAdapter
             if not DesktopAdapter._goal_progress_preserved(comparable_goal,after_goal):
                 return None
         pane_receipt={}

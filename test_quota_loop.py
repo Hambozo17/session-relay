@@ -218,6 +218,11 @@ class QuotaLoop(unittest.TestCase):
 
 
     def test_codex_idle_usage_limited_handoffs_block_bounces_until_each_target_resets(self):
+        for budget in (None, 100):
+            with self.subTest(budget=budget):
+                self._codex_idle_goal_recovery_case(budget)
+
+    def _codex_idle_goal_recovery_case(self, budget):
         with tempfile.TemporaryDirectory() as folder,contextlib.ExitStack() as stack:
             root=pathlib.Path(folder)
             class MultiAccounts:
@@ -234,7 +239,7 @@ class QuotaLoop(unittest.TestCase):
                 def current_desktop_key(self):return None
                 def probe(self,record,force=False,home=None):return self.quotas[record['key']]
             accounts=MultiAccounts()
-            goal={'goal_id':'goal-1','status':'active','token_budget':100,'tokens_used':40,
+            goal={'goal_id':'goal-1','status':'active','token_budget':budget,'tokens_used':40,
                 'time_used_seconds':30,'created_at_ms':100,'deferred':False}
             row={'id':'chat','status':'failed','error_kind':'quota','goal_status':'active',
                 'turn_id':'initial-A','_turn_started_at_ms':int((time.time()-10)*1000),
@@ -278,6 +283,8 @@ class QuotaLoop(unittest.TestCase):
                     ('post-handoff timestamp missing',dict(row,_turn_started_at_ms=None)),
                     ('turn predates handoff',dict(row,_turn_started_at_ms=int(completed_b['started_at']*1000))),
                     ('native goal missing',dict(row,_goal_record=None)),
+                    ('goal budget missing',dict(row,_goal_record={
+                        key:value for key,value in row['_goal_record'].items() if key!='token_budget'})),
                     ('goal identity changed',dict(row,_goal_record=dict(row['_goal_record'],goal_id='other'))),
                     ('goal budget changed',dict(row,_goal_record=dict(row['_goal_record'],token_budget=101))),
                     ('goal progress regressed',dict(row,_goal_record=dict(row['_goal_record'],tokens_used=39))),

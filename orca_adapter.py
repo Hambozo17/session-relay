@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, os, pathlib, re, shutil, sqlite3, time, uuid
 from accounts import identity, protected_json, read_goal, transfer_goal, codex_binary, inherit_project_trust, database_connection, plain_path, LOCALDATA, load_json, atomic_json
 from local_rpc import OrcaRpc, RpcError
-from transcript import read_transcript, resume_arguments, powershell_quote
+from transcript import read_transcript, resume_arguments, permission_policy_equal, powershell_quote
 from recovery_policy import proxy_session, recovery_error
 
 def write_accepted(result):
@@ -149,7 +149,9 @@ class OrcaAdapter:
                         # A verified launch plus the exact same physical transcript
                         # binds that stale path to the explicitly attested home.
                         info.update(home=binding['home'],path=binding['path'],account_key=binding['key'])
-                        for key in ('status','error_kind','turn_id','event_pos','model','effort','model_provider','approval_policy','sandbox_policy'):
+                        for key in ('status','error_kind','turn_id','event_pos','model','effort','model_provider',
+                                'approval_policy','sandbox_policy','permission_profile',
+                                'active_permission_profile','_context_turn_id'):
                             if key in actual:info[key]=actual[key]
                         if actual['status']!='failed':info.pop('_screen_quota',None)
                         bound_goal = read_goal(binding['home'], info['id'])
@@ -265,6 +267,25 @@ class OrcaAdapter:
             'target':target['key'],'operation':operation})
         return dict(fresh,terminal=created['handle'],incarnation=created['incarnationId'],pty_id=created.get('ptyId'))
 
+    def wait_for_resumed_context(self, original, destination, previous_turn, timeout=30):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            current=read_transcript(destination)
+            turn=current.get('turn_id')
+            if turn and turn!=previous_turn and current.get('_context_turn_id')==turn:
+                if current.get('status')=='failed':
+                    raise RuntimeError('The resumed turn failed')
+                if current.get('status') not in ('running','idle'):
+                    raise RuntimeError('The resumed turn did not reach a verifiable state')
+                if (current.get('model')!=original.get('model')
+                        or current.get('effort')!=original.get('effort')):
+                    raise RuntimeError('The resumed turn changed its original model settings')
+                if not permission_policy_equal(original,current):
+                    raise RuntimeError('The resumed turn changed its original permission policy')
+                return current
+            time.sleep(.5)
+        raise RuntimeError('The resumed turn has no fresh permission context')
+
     def rotate(self, session_ids, target, journal, *, repair_depleted_idle=False):
         sessions = [self.get(sid) for sid in session_ids]
         if any(s and (proxy_session(s) or s['status'] == 'interrupted') for s in sessions):
@@ -296,6 +317,13 @@ class OrcaAdapter:
         target_home = pathlib.Path(target['orca_home'])
         check = identity(protected_json(target_home / 'auth.json'))
         if not check or check['key'] != target['key']: raise RuntimeError('The Orca destination login changed')
+        for original in sessions:
+            fresh=self.get(original['id'])
+            if (not fresh or fresh.get('turn_id')!=original.get('turn_id')
+                    or fresh.get('model')!=original.get('model')
+                    or fresh.get('effort')!=original.get('effort')
+                    or not permission_policy_equal(original,fresh)):
+                raise RuntimeError('The original session settings changed before recovery')
         for session in sessions: inherit_project_trust(session['home'], target_home, session['cwd'])
         journal('orca-recovery-context', {'context':{s['id']:dict(s) for s in sessions}})
         if target.get('orca_id'):
@@ -309,6 +337,9 @@ class OrcaAdapter:
             fresh = self.get(sid)
             if not fresh or fresh['pty_id'] != original['pty_id'] or fresh['incarnation'] != original['incarnation'] or fresh['waiting']:
                 raise RuntimeError('The original Orca pane changed before recovery')
+            if (fresh.get('model')!=original.get('model') or fresh.get('effort')!=original.get('effort')
+                    or not permission_policy_equal(original,fresh)):
+                raise RuntimeError('The original session permission policy changed before recovery')
             if fresh.get('goal_status') != original.get('goal_status'):
                 raise RuntimeError('The Goal changed before recovery')
             if fresh.get('turn_id') != original.get('turn_id') or (fresh['id'] not in repair_ids and fresh['status'] != 'running' and fresh.get('error_kind') not in ('quota','login') and fresh.get('goal_status')!='usage_limited'):
@@ -439,34 +470,38 @@ class OrcaAdapter:
                 raise RuntimeError('A new Goal was added during recovery')
             if goal and (not current_goal or current_goal['goal_id'] != goal['goal_id'] or current_goal['status'] not in ('active','usage_limited')):
                 raise RuntimeError('The Goal changed before continuation')
-            # Codex may automatically continue an active Goal on resume. Never add a duplicate turn.
-            if replacement['status'] != 'running':
+            original_turn=original.get('turn_id')
+            # A fresh turn may have started automatically. Its own turn_context,
+            # not the copied source context, must confirm the launch policy.
+            if (replacement['status']=='running'
+                    or (replacement.get('turn_id') and replacement.get('turn_id')!=original_turn)):
+                replacement=self.wait_for_resumed_context(original,destination,original_turn)
+            else:
                 observed = self.rpc.call('terminal.agentStatus',{'terminal':handle}).get('agentStatus') or {}
                 observed_status = observed.get('status') or observed
                 observed_state = observed_status if isinstance(observed_status,str) else observed_status.get('state')
                 if observed_state in ('waiting','permission','asking','approval','needs-input'):
                     raise RuntimeError('The resumed chat is waiting for user input or approval')
                 latest = read_transcript(destination)
-                if latest.get('event_pos') != replacement.get('event_pos'):
+                if (latest.get('turn_id') and latest.get('turn_id')!=original_turn) or latest.get('status')=='running':
+                    replacement=self.wait_for_resumed_context(original,destination,original_turn)
+                elif latest.get('event_pos') != replacement.get('event_pos'):
                     raise RuntimeError('The resumed turn changed before continuation')
-                receipt={'session':sid,'terminal':handle,'incarnation':fresh['incarnation'],
-                    'turn':replacement.get('turn_id'),'goal':bool(goal)}
-                journal('send-continuation', receipt)
-                result = self.rpc.call('terminal.send', {'terminal': handle, 'expectedIncarnationId': fresh['incarnation'],
-                    'text': '/goal resume' if goal else 'continue', 'enter': True, 'agentPrompt': True,
-                    'requireWriteSettlement': True, 'waitSubmitMs': 5000,
-                    'client': {'id': 'session-relay', 'type': 'desktop'}},
-                    envelope={'orchestrationRequestId': str(uuid.uuid4())})
-                if not write_accepted(result): raise RuntimeError('Orca did not confirm the continuation')
-                journal('continuation-accepted',receipt)
-                deadline = time.monotonic() + 30
-                while time.monotonic() < deadline:
-                    time.sleep(.5)
-                    current = read_transcript(destination)
-                    if current.get('turn_id') and current['turn_id'] != replacement.get('turn_id'):
-                        if current['status'] in ('running', 'idle'): break
-                        if current['status'] == 'failed': raise RuntimeError('The resumed turn failed')
-                else: raise RuntimeError('Continuation was submitted but no new turn was confirmed')
+                else:
+                    # The launch arguments explicitly reconstruct the verified
+                    # legacy policy; the old copied context is not proof of a
+                    # new turn's permissions.
+                    receipt={'session':sid,'terminal':handle,'incarnation':fresh['incarnation'],
+                        'turn':replacement.get('turn_id'),'goal':bool(goal)}
+                    journal('send-continuation', receipt)
+                    result = self.rpc.call('terminal.send', {'terminal': handle, 'expectedIncarnationId': fresh['incarnation'],
+                        'text': '/goal resume' if goal else 'continue', 'enter': True, 'agentPrompt': True,
+                        'requireWriteSettlement': True, 'waitSubmitMs': 5000,
+                        'client': {'id': 'session-relay', 'type': 'desktop'}},
+                        envelope={'orchestrationRequestId': str(uuid.uuid4())})
+                    if not write_accepted(result): raise RuntimeError('Orca did not confirm the continuation')
+                    journal('continuation-accepted',receipt)
+                    replacement=self.wait_for_resumed_context(original,destination,original_turn)
             journal('session-recovered', {'session': sid, 'target': target['key']})
             recovered.append(sid)
         return recovered

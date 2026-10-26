@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pathlib
 import queue
@@ -660,6 +661,19 @@ class DesktopAdapter:
         return tuple((key, goal.get(key)) for key in keys)
 
     @staticmethod
+    def _goal_accounting_valid(goal):
+        if (not isinstance(goal, dict) or not isinstance(goal.get('goal_id'), str)
+                or not goal['goal_id'].strip() or 'token_budget' not in goal):
+            return False
+        budget = goal['token_budget']
+        if budget is not None and (not isinstance(budget, (int, float))
+                or isinstance(budget, bool) or not math.isfinite(budget) or budget < 0):
+            return False
+        return all(isinstance(goal.get(field), (int, float))
+            and not isinstance(goal[field], bool) and math.isfinite(goal[field]) and goal[field] >= 0
+            for field in ('tokens_used', 'time_used_seconds'))
+
+    @staticmethod
     def _goal_progress_preserved(before, after):
         if before is None or after is None:
             return before is None and after is None
@@ -796,9 +810,7 @@ class DesktopAdapter:
         if session.get('goal_status')=='usage_limited':
             goal=session.get('_goal_record')
             return bool(session.get('status') in ('failed','idle') and isinstance(goal,dict)
-                and goal.get('status')=='usage_limited' and goal.get('goal_id')
-                and all(isinstance(goal.get(k),(int,float)) and not isinstance(goal.get(k),bool)
-                    for k in ('token_budget','tokens_used','time_used_seconds')))
+                and goal.get('status')=='usage_limited' and DesktopAdapter._goal_accounting_valid(goal))
         return bool(session.get('status')=='failed' and kind in quota_kinds|login_kinds
             and session.get('goal_status') in (None,'active'))
 
