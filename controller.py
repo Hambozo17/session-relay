@@ -9,7 +9,7 @@ from transcript import permission_policy_equal
 CONFIG = LOCALDATA / 'config.json'
 STATUS = LOCALDATA / 'status.json'
 JOURNAL = LOCALDATA / 'journal.json'
-VERSION = '1.0.19'
+VERSION = '1.0.20'
 
 def config():
     try: return load_json(CONFIG)
@@ -176,7 +176,9 @@ def needs_switch(session, quota, threshold):
     if proxy_session(session): return False
     if session.get('status') == 'interrupted': return False
     if session.get('waiting') or session.get('is_child') or session.get('goal_status') not in (None, 'active', 'usage_limited'): return False
-    if session.get('goal_status') == 'usage_limited': return True
+    # A user can resume a turn while the persisted Goal still says limited.
+    # Keep that live turn working until fresh quota or a turn failure needs recovery.
+    if session.get('goal_status') == 'usage_limited' and session.get('status') != 'running': return True
     if session.get('status') == 'failed' and recovery_error(session.get('error_kind')):
         if session.get('_screen_quota'):
             return any(isinstance(quota.get(k), (int, float)) and quota[k] <= threshold for k in ('five_remaining', 'weekly_remaining'))

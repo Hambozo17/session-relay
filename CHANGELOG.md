@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.20
+
+- Preserve a running turn when its saved Goal still says usage limited and fresh allowance is healthy. Continue monitoring the quota threshold and recover when the turn stops for usage or login failure.
+
 ## 1.0.19
 
 - Refresh saved-account allowances and failed sign-ins every minute, with the actual interval shown in the panel.

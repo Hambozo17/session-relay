@@ -62,6 +62,15 @@ class Quotas(unittest.TestCase):
         row={'status':'failed','error_kind':'quota','_screen_quota':True}
         self.assertFalse(needs_switch(row,self.window(five=20),2))
         self.assertTrue(needs_switch(row,self.window(five=100),2))
+    def test_running_turn_with_stale_limited_goal_uses_fresh_quota(self):
+        row={'status':'running','goal_status':'usage_limited','_runtime_status':'active'}
+        self.assertFalse(needs_switch(row,self.window(five=8),2))
+        self.assertFalse(needs_switch(row,{'valid':False},2))
+        self.assertTrue(needs_switch(row,self.window(five=98),2))
+        self.assertTrue(needs_switch(row,self.window(five=8,week=100),2))
+        for status in ('failed','idle'):
+            self.assertTrue(needs_switch(dict(row,status=status),self.window(five=8),2))
+        self.assertTrue(needs_switch(dict(row,status='failed',error_kind='login'),self.window(five=8),2))
     def test_desktop_native_quota_codes_without_goal(self):
         for code in ('usageLimitExceeded','rate_limit_exceeded'):
             self.assertTrue(needs_switch({'status':'failed','error_kind':code,'goal_status':None},{},2))
