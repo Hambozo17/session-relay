@@ -167,7 +167,9 @@ class QuotaLoop(unittest.TestCase):
                 def probe(self,record,force=False,home=None):return self.quotas[record['key']]
             accounts=MultiAccounts()
             settings={'cwd':'C:/project','model':'gpt-test','effort':'high','model_provider':'openai',
-                'approval_policy':'on-request','sandbox_policy':{'type':'workspaceWrite'}}
+                'approval_policy':'on-request','sandbox_policy':{'type':'workspace-write',
+                    'network_access':False,'writable_roots':[],
+                    'exclude_tmpdir_env_var':False,'exclude_slash_tmp':False}}
             row={'id':'chat','status':'failed','error_kind':'quota','turn_id':'turn-B-failure',
                 '_turn_started_at_ms':int(now*1000),'account_key':'B','home':str(root/'B'),
                 'connected':True,'supported':True,'provider':'codex','terminal':'terminal-B',
@@ -176,7 +178,7 @@ class QuotaLoop(unittest.TestCase):
                 'sessions':['chat'],'started_at':now-20,'updated_at':now-10,
                 'target_quota':{'allowance_generation':0,'reset_at':None,'weekly_reset_at':None},
                 'orca_recovery_context':{'chat':dict(row,turn_id='turn-before-B',status='running',
-                    account_key='A')},
+                    account_key='A',sandbox_policy={'type':'workspace-write'})},
                 'orca_target_panes':{'chat':{'target':'B','terminal':'terminal-B','incarnation':'inc-B','pty_id':'pty-B'}}}
             operations=root/'operations';operations.mkdir()
             (operations/'completed-A-to-B.json').write_text(json.dumps(op_b),encoding='utf-8')
@@ -187,6 +189,9 @@ class QuotaLoop(unittest.TestCase):
                 stack.enter_context(patch.object(controller,name,value))
             stack.enter_context(patch.object(controller,'config',return_value=cfg))
             adapter=Adapter([row],'orca');other=Adapter([],'codex')
+            self.assertIsNotNone(controller.quota_failure_after_handoff(row,op_b))
+            self.assertIsNone(controller.quota_failure_after_handoff(
+                dict(row,sandbox_policy=dict(row['sandbox_policy'],network_access=True)),op_b))
             first=controller.Controller(accounts,{'orca':adapter,'codex':other});first.refresh_started=time.time()
             try:
                 self.assertEqual(controller.quota_failed_target_keys('orca',[row],first.recovery_attempts,accounts.quotas),set())

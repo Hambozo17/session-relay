@@ -281,7 +281,9 @@ def quota_failure_after_handoff(session, operation):
         pane_receipt={}
     else:
         fields=('cwd','model','effort','model_provider','approval_policy','sandbox_policy')
-        if any(field not in before or session.get(field)!=before.get(field) for field in fields):
+        if (any(field not in before for field in fields)
+                or any(session.get(field)!=before.get(field) for field in fields[:4])
+                or not permission_policy_equal(before,session)):
             return None
         target_pane=(operation.get('orca_target_panes') or {}).get(sid) or {}
         expected_terminal=target_pane.get('terminal') or before.get('terminal')
