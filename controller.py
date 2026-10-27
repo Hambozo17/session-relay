@@ -211,7 +211,7 @@ def confirmed_interruptions(operation):
     saved=operation.get('interruption_receipts',{})
     if operation.get('phase') == 'desktop-close-intent':
         saved=operation.get('metadata',{}).get('originals',{})
-    result=[dict(value,session=sid,account=operation.get('outgoing')) for sid,value in saved.items()
+    result=[dict(value,session=sid,account=operation.get('verified_interruption_accounts',{}).get(sid,operation.get('outgoing'))) for sid,value in saved.items()
             if value.get('relay_interrupted') and value.get('goal') in (None,'active')]
     if operation.get('phase')=='desktop-interrupt-confirmed':
         latest=operation.get('metadata',{})
@@ -471,6 +471,33 @@ def desktop_restart_superseded_by_later_turns(operation, sessions, current_key):
                 and not row.get('_screen_quota') and row.get('goal_status') in (None,'active','usage_limited'))
         if not (running or failed):return False
     return True
+
+def desktop_startup_mixed_recovery(operation, sessions, current_key):
+    # Attest new native turns separately; the adapter authorizes only unchanged
+    # relay-paused siblings. Never normalize a live Goal or continue it again.
+    from desktop_adapter import pending_desktop_recovery
+    if (operation.get('phase') not in ('desktop-open-thread-intent','desktop-reopen-intent')
+            or not current_key or current_key!=operation.get('target') or not operation.get('sessions')):
+        return None
+    rows={s['id']:s for s in sessions};working=[];failed=[];pending=[]
+    for sid in operation['sessions']:
+        row=rows.get(sid);before=operation.get('recovery_context',{}).get(sid)
+        if not desktop_startup_row_verified(before,row,current_key):return None
+        if desktop_startup_new_turn(operation,before,row):
+            if row.get('status')=='running':working.append(sid)
+            elif row.get('status')=='failed' and recovery_error(row.get('error_kind')) and not row.get('_screen_quota'):
+                failed.append(sid)
+            else:return None
+        else:
+            receipt=operation.get('interruption_receipts',{}).get(sid,{})
+            if (row.get('turn_id')!=before['turn'] or row.get('status')!='interrupted'
+                    or not receipt.get('relay_interrupted') or receipt.get('turn')!=before['turn']
+                    or receipt.get('settings')!=before['settings']):return None
+            pending.append(sid)
+    if not pending or not (working or failed):return None
+    if pending_desktop_recovery(dict(operation,sessions=pending),sessions,current_key)!=pending:return None
+    return {'working':working,'failed':failed,'pending':pending}
+
 
 def desktop_close_superseded_by_completed_turn(operation, sessions, current_key):
     # Retire a failed Quit intent after the user subsequently completed the
@@ -829,11 +856,37 @@ class Controller:
                 and set(operation['sessions'])<=set(setting.get('sessions',[])))
             later=(app=='codex' and startup_selected and self.accounts.find(self.accounts.current_desktop_key()) is not None
                 and desktop_restart_superseded_by_later_turns(operation,discovered.get(app,[]),self.accounts.current_desktop_key()))
+            mixed=(desktop_startup_mixed_recovery(operation,discovered.get(app,[]),self.accounts.current_desktop_key())
+                if app=='codex' and startup_selected and self.accounts.find(self.accounts.current_desktop_key()) is not None else None)
+            native_account=None;native_quota=None;native_working=[];native_intent=None
+            if later or mixed:
+                native_intent=json.loads(json.dumps({key:operation.get(key)
+                    for key in ('target','target_quota','recovery_context','started_at','updated_at')}))
+                native_account=self.accounts.current_desktop_key()
+                target=self.accounts.find(native_account)
+                try:
+                    native_quota=(self.accounts.probe_desktop(target,force=True) if hasattr(self.accounts,'probe_desktop')
+                        else self.accounts.probe(target,force=True,home=REAL_HOME))
+                except Exception as exc:
+                    self.diagnose('checking verified native recovery allowance',exc)
+                    continue
+                # A working turn can belong to a later account/window than the
+                # stale intent. Recheck its attestation after the fresh probe.
+                setting=config().get(app,{})
+                if (not native_quota.get('valid') or self.accounts.current_desktop_key()!=native_account
+                        or not setting.get('enabled') or not set(operation['sessions'])<=set(setting.get('sessions',[]))
+                        or not (desktop_restart_superseded_by_later_turns(operation,discovered.get(app,[]),native_account) if later
+                            else desktop_startup_mixed_recovery(operation,discovered.get(app,[]),native_account)==mixed)):
+                    continue
+                native_working=[row['id'] for row in discovered.get(app,[])
+                    if row['id'] in operation['sessions'] and row.get('status')=='running']
             safe=safe or later
+            safe=safe or bool(mixed and mixed['failed'])
             startup_failed=(app=='codex' and startup_selected and self.accounts.find(self.accounts.current_desktop_key()) is not None
                 and desktop_restart_failed_before_send(operation,discovered.get(app,[]),self.accounts.current_desktop_key()))
             safe=safe or startup_failed
-            new_startup_failure=bool((later or startup_failed) and self.accounts.current_desktop_key()==operation.get('target')
+            new_startup_failure=bool((later or mixed or startup_failed)
+                and (native_account is not None or self.accounts.current_desktop_key()==operation.get('target'))
                 and any(row['id'] in operation['sessions'] and row.get('status')=='failed'
                     and desktop_startup_new_turn(operation,operation.get('recovery_context',{}).get(row['id'],{}),row)
                     for row in discovered.get(app,[])))
@@ -843,8 +896,8 @@ class Controller:
             if app=='codex' and not safe:
                 from desktop_adapter import pending_desktop_recovery
                 rows=discovered.get(app,[]);current_key=self.accounts.current_desktop_key()
-                pending=pending_desktop_recovery(operation,rows,current_key)
-                if pending is not None:
+                pending=mixed['pending'] if mixed else pending_desktop_recovery(operation,rows,current_key)
+                if pending is not None and not mixed:
                     by_id={row['id']:row for row in rows}
                     if any(not desktop_startup_row_verified(operation.get('recovery_context',{}).get(sid),by_id.get(sid),current_key)
                             for sid in operation.get('sessions',[])):pending=None
@@ -865,7 +918,7 @@ class Controller:
                     target=self.accounts.find(operation.get('target'))
                     if target:
                         self.stage='checking delayed recovery allowance'
-                        quota=(self.accounts.probe_desktop(target,force=True) if hasattr(self.accounts,'probe_desktop')
+                        quota=native_quota if mixed else (self.accounts.probe_desktop(target,force=True) if hasattr(self.accounts,'probe_desktop')
                                else self.accounts.probe(target,force=True,home=REAL_HOME))
                         if quota.get('valid') and any(isinstance(quota.get(k),(int,float)) and quota[k]<=threshold for k in ('five_remaining','weekly_remaining')):
                             for row in rows:
@@ -923,14 +976,25 @@ class Controller:
                     if not (row.get('goal_status') == 'usage_limited' or (row.get('status') == 'interrupted' and receipt == (row.get('turn_id'), row.get('_settings_fingerprint')))):
                         safe = False; break
             if safe:
-                operation['state']='complete' if recovered else 'reconciled-after-quota-failure' if failed_after_send or new_startup_failure else 'reconciled-before-continuation'
+                if native_account is not None:
+                    operation.setdefault('startup_intent',native_intent)
+                    operation['target']=native_account
+                    operation['target_quota']={key:native_quota.get(key) for key in ('reset_at','weekly_reset_at')}
+                    operation['target_quota']['allowance_generation']=native_quota.get('_allowance_generation',0)
+                    operation['recovered_sessions']=list(native_working)
+                    if mixed:
+                        for sid in mixed['pending']:
+                            operation.setdefault('verified_interruption_accounts',{})[sid]=native_account
+                            row=next(row for row in discovered[app] if row['id']==sid)
+                            self.adapters[app].recovery_receipts[sid]=(row['turn_id'],row['_settings_fingerprint'])
+                operation['state']='complete' if recovered or native_working else 'reconciled-after-quota-failure' if failed_after_send or new_startup_failure else 'reconciled-before-continuation'
                 if startup_failed:
                     operation['reconciliation']='Verified original owners stopped on quota/login failure before any continuation; reassessing normal recovery.'
                 if failed_after_send:self.note('Orca: continuation reached a new usage/login failure; checking available accounts again.')
                 if finished:
                     operation['reconciliation']='Failed Quit superseded by a later completed native turn with unchanged settings and no active Goal; no restart or continuation replayed.'
                     self.note('Codex: cleared an old Quit failure after verifying the chat subsequently completed; leaving it idle.')
-                if later:
+                if later or mixed:
                     operation['reconciliation']='Startup intent superseded by later native turns with preserved settings and Goal accounting; no old prompt replayed.'
                     operation['reconciliation_evidence']={'account':self.accounts.current_desktop_key(),
                         'turns':{row['id']:row.get('turn_id') for row in discovered.get(app,[]) if row['id'] in operation['sessions']},

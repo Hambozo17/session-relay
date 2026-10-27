@@ -465,7 +465,8 @@ class DesktopStartupCycles(unittest.TestCase):
             accounts=NativeAccounts()
             class NativeAdapter(Adapter):
                 def __init__(self):
-                    super().__init__([row]);self.calls=[];self.open_error=None
+                    super().__init__([row]);self.calls=[];self.open_error=None;self.send_error=None
+                    self.attempted_sends=set()
                 def request_reopen(self,ids):
                     self.calls.append(('open',list(ids)))
                     if self.open_error:raise self.open_error
@@ -478,9 +479,28 @@ class DesktopStartupCycles(unittest.TestCase):
                     for s in self.rows:
                         if s['id'] in ids:s.update(account_key=target['key'],status='running',error_kind=None,
                             turn_id='continued-'+str(len(self.calls)),_turn_started_at_ms=(now[0]+1)*1000)
-                def resume_in_place(self,*args,**kwargs):
-                    self.calls.append(('unexpected-send',))
-                    raise AssertionError('No startup send expected')
+                def resume_in_place(self,ids,journal,recovery_operation=None):
+                    # Run the actual adapter's pending checks, validation,
+                    # submission journal and postcondition against a fake owner.
+                    from desktop_adapter import DesktopAdapter
+                    native=DesktopAdapter.__new__(DesktopAdapter)
+                    native.accounts=accounts;native._lock=threading.RLock()
+                    native.recovery_receipts=self.recovery_receipts
+                    native._attempted_sends=self.attempted_sends
+                    native._catalog=lambda:[];native._scan=lambda _:copy.deepcopy(self.rows)
+                    adapter=self
+                    class Owner:
+                        def call(self,request,**kwargs):
+                            sid=request['thread'];adapter.calls.append(('resume',sid))
+                            if adapter.send_error:raise adapter.send_error
+                            s=next(s for s in adapter.rows if s['id']==sid)
+                            s.update(status='running',turn_id='resumed-'+sid,
+                                _turn_started_at_ms=(now[0]+1)*1000)
+                            return {'session':{'status':'running','turn_id':s['turn_id'],
+                                'settings_fingerprint':s['_settings_fingerprint'],
+                                'client_user_message_id':request['operation_id']}}
+                    native._client=lambda:Owner()
+                    return native.resume_in_place(ids,journal,recovery_operation)
             adapter=NativeAdapter();cfg={'codex':{'enabled':True,'sessions':['chat']},
                 'orca':{'enabled':False,'sessions':[]},'included_resets':False}
             path=root/'operations/startup.json';path.parent.mkdir();path.write_text(json.dumps(operation))
@@ -504,7 +524,7 @@ class DesktopStartupCycles(unittest.TestCase):
                 self.assertFalse(c.unresolved);self.assertFalse(c.attention);self.assertEqual(adapter.calls,[])
                 self.assertEqual(row,original);self.assertTrue(c.keep_awake)
                 saved=json.loads((root/'operations/startup.json').read_text())
-                self.assertEqual(saved['state'],'reconciled-before-continuation')
+                self.assertEqual(saved['state'],'complete')
                 self.assertEqual(saved['reconciliation_evidence']['turns'],{'chat':'new'})
                 restarted=restart();restarted.cycle();self.assertFalse(restarted.unresolved)
                 self.assertEqual(adapter.calls,[]);self.assertEqual(cfg['codex']['sessions'],['chat'])
@@ -523,6 +543,88 @@ class DesktopStartupCycles(unittest.TestCase):
             with self.subTest(field=field),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
                 row['_goal_record'][field]=value;c.cycle();self.assertEqual(len(c.unresolved),1)
                 self.assertEqual(adapter.calls,[])
+
+    def test_verified_running_recovery_tracks_current_account_window_after_reset(self):
+        for current in ('A','B'):
+            with self.subTest(current=current),self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):
+                accounts.current=current;row['account_key']=current
+                accounts.quotas[current]=accounts.quota(2)
+                c.cycle();self.assertFalse(c.unresolved);self.assertEqual(adapter.calls,[])
+                saved=json.loads((root/'operations/startup.json').read_text())
+                self.assertEqual(saved['state'],'complete');self.assertEqual(saved['target'],current)
+                self.assertEqual(saved['target_quota']['allowance_generation'],2)
+                self.assertEqual(saved['startup_intent']['target_quota']['allowance_generation'],0)
+                self.assertEqual(controller.quota_failed_target_keys('codex',[row],c.recovery_attempts,accounts.quotas),set())
+                other='A' if current=='B' else 'B';accounts.quotas[other]['five_remaining']=0
+                now[0]+=10;row.update(status='failed',error_kind='quota',turn_id='new-failure',_turn_started_at_ms=now[0]*1000)
+                row['_goal_record']['tokens_used']+=1
+                c.cycle();self.assertEqual(adapter.calls,[])
+                restarted=restart();restarted.cycle();self.assertEqual(adapter.calls,[])
+                self.assertEqual(controller.quota_failed_target_keys('codex',[row],restarted.recovery_attempts,accounts.quotas),{current})
+                saved=json.loads((root/'operations/startup.json').read_text())
+                self.assertEqual(saved['quota_failed_sessions']['chat']['target_quota']['allowance_generation'],2)
+                accounts.quotas[current]=accounts.quota(3);restarted.cycle()
+                self.assertEqual(adapter.calls,[('rotate',['chat'],current)])
+
+    def add_paused_sibling(self,c,adapter,row,root,cfg):
+        sid='123e4567-e89b-42d3-a456-426614174000'
+        sibling=copy.deepcopy(row)
+        sibling.update(id=sid,status='interrupted',turn_id='old-sibling',_runtime_status='idle',goal_status='active')
+        sibling['_goal_record'].update(goal_id='sibling-goal',status='active')
+        adapter.rows.append(sibling);cfg['codex']['sessions'].append(sid)
+        operation=c.unresolved[0];operation['sessions'].append(sid)
+        operation['recovery_context'][sid]={'turn':'old-sibling','settings':'same','goal_record':copy.deepcopy(sibling['_goal_record'])}
+        operation['interruption_receipts']={sid:{'turn':'old-sibling','settings':'same','relay_interrupted':True,
+            'goal':'active','goal_record':copy.deepcopy(sibling['_goal_record'])}}
+        for file in (root/'operations/startup.json',root/'journal.json'):file.write_text(json.dumps(operation))
+        return sibling
+
+    def test_mixed_running_limited_goal_only_resumes_confirmed_paused_sibling_once(self):
+        with self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):
+            sibling=self.add_paused_sibling(c,adapter,row,root,cfg);original=copy.deepcopy(row)
+            accounts.quotas['B']=accounts.quota(2)
+            c.cycle();self.assertFalse(c.unresolved);self.assertFalse(c.attention)
+            self.assertEqual(adapter.calls,[('resume',sibling['id'])]);self.assertEqual(row,original)
+            self.assertEqual(sibling['status'],'running')
+            saved=json.loads((root/'operations/startup.json').read_text())
+            self.assertEqual(saved['state'],'complete');self.assertEqual(set(saved['recovered_sessions']),{'chat',sibling['id']})
+            self.assertEqual(saved['target_quota']['allowance_generation'],2)
+            restarted=restart();restarted.cycle();self.assertFalse(restarted.unresolved)
+            self.assertEqual(adapter.calls,[('resume',sibling['id'])])
+
+    def test_mixed_new_quota_failure_preserves_confirmed_sibling_and_blocks_target(self):
+        with self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):
+            sibling=self.add_paused_sibling(c,adapter,row,root,cfg)
+            row.update(status='failed',error_kind='quota');accounts.quotas['B']=accounts.quota(2)
+            c.cycle();self.assertFalse(c.unresolved)
+            self.assertEqual(adapter.calls,[('rotate',['chat',sibling['id']],'A')])
+            saved=json.loads((root/'operations/startup.json').read_text())
+            self.assertEqual(saved['state'],'reconciled-after-quota-failure')
+            self.assertEqual(saved['target_quota']['allowance_generation'],2)
+            self.assertEqual(saved['verified_interruption_accounts'][sibling['id']],'B')
+            self.assertEqual(controller.quota_failed_target_keys('codex',[row],c.recovery_attempts,accounts.quotas),{'B'})
+            restarted=restart();self.assertFalse(restarted.unresolved)
+            self.assertEqual(controller.quota_failed_target_keys('codex',[row],restarted.recovery_attempts,accounts.quotas),{'B'})
+
+    def test_mixed_sibling_guards_and_uncertain_send_are_preserved(self):
+        for change in ('manual','approval','settings','goal','deferred','uncertain'):
+            with self.subTest(change=change),self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):
+                sibling=self.add_paused_sibling(c,adapter,row,root,cfg)
+                if change=='manual':c.unresolved[0]['interruption_receipts'].clear()
+                if change=='approval':sibling['waiting']=True
+                if change=='settings':sibling['_settings_fingerprint']='different'
+                if change=='goal':sibling['_goal_record']['goal_id']='replaced'
+                if change=='deferred':sibling['_goal_deferred']=True
+                if change=='uncertain':
+                    from desktop_adapter import DesktopUncertainError
+                    adapter.send_error=DesktopUncertainError('unknown send result')
+                c.cycle();self.assertEqual(len(c.unresolved),1)
+                self.assertEqual(adapter.calls,[('resume',sibling['id'])] if change=='uncertain' else [])
+                if change=='uncertain':
+                    saved=json.loads((root/'operations/startup.json').read_text())
+                    self.assertEqual(saved['phase'],'desktop-continuation-intent')
+                    adapter.send_error=None;restarted=restart();restarted.cycle()
+                    self.assertEqual(adapter.calls,[('resume',sibling['id'])]);self.assertEqual(len(restarted.unresolved),1)
         for setting in ({'enabled':False},{'sessions':[]}):
             with self.subTest(setting=setting),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
                 cfg['codex'].update(setting);c.cycle();self.assertEqual(len(c.unresolved),1)
