@@ -7,7 +7,7 @@ from local_rpc import HIDDEN
 from watchdog import ensure_monitor
 
 ROOT = pathlib.Path(__file__).resolve().parent
-PANEL_VERSION = '1.0.20'
+PANEL_VERSION = '1.0.21'
 
 
 def window_geometry(root):

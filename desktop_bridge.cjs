@@ -241,6 +241,30 @@ function settingsOf(state) {
   return output;
 }
 
+function gitWorkspaceIdentity(root) {
+  if (typeof root !== 'string' || !path.isAbsolute(root)) return null;
+  try {
+    const marker=path.join(root,'.git');
+    const info=fs.statSync(marker);
+    let common;
+    if (info.isDirectory()) common=fs.realpathSync(marker);
+    else if (info.isFile() && info.size<=4096) {
+      const text=fs.readFileSync(marker,'utf8').trim();
+      if (!text.startsWith('gitdir: ')) return null;
+      const admin=fs.realpathSync(path.resolve(path.dirname(marker),text.slice(8)));
+      const link=path.join(admin,'commondir'),back=path.join(admin,'gitdir');
+      if (!fs.statSync(link).isFile() || !fs.statSync(back).isFile() ||
+          Math.max(fs.statSync(link).size,fs.statSync(back).size)>4096) return null;
+      common=fs.realpathSync(path.resolve(admin,fs.readFileSync(link,'utf8').trim()));
+      if (path.dirname(admin)!==path.join(common,'worktrees') ||
+          fs.realpathSync(fs.readFileSync(back,'utf8').trim())!==fs.realpathSync(marker)) return null;
+    } else return null;
+    if (!fs.statSync(common).isDirectory() || !fs.statSync(path.join(common,'HEAD')).isFile() ||
+        !fs.statSync(path.join(common,'config')).isFile()) return null;
+    return common.replace(/\\/g,'/').toLowerCase();
+  } catch (_) { return null; }
+}
+
 function summarize(state, owner) {
   const turns = turnsOf(state);
   const last = turns.length ? turns[turns.length - 1] : {};
@@ -294,6 +318,10 @@ function summarize(state, owner) {
         const roots=holder.runtimeWorkspaceRoots, keys=roots.map(absolute);
         holder.runtimeWorkspaceRoots=roots.filter((root,i)=>!keys[i] ||
           !keys.some(parent=>parent && keys[i]!==parent && keys[i].startsWith(parent+'/')));
+        holder.runtimeWorkspaceRoots=holder.runtimeWorkspaceRoots.map(root=>{
+          const identity=gitWorkspaceIdentity(root);
+          return identity ? 'git-common:'+identity : root;
+        }).filter((root,i,all)=>typeof root!=='string' || !root.startsWith('git-common:') || all.indexOf(root)===i);
       }
     }
   }

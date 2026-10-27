@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.21
+
+- Recognize verified Git main/worktree root aliases under full access after Codex reopens, while preserving the raw settings and restricted permission checks.
+- Retry original-thread reopening after a pre-submission startup failure, and reconcile later verified native turns without replaying an old continuation.
+- Prioritize selected and recently active conversations for monitoring; app-wide recovery still verifies the full inventory before a restart.
+
 ## 1.0.20
 
 - Preserve a running turn when its saved Goal still says usage limited and fresh allowance is healthy. Continue monitoring the quota threshold and recover when the turn stops for usage or login failure.

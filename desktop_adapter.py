@@ -99,7 +99,7 @@ def _installed_package_location() -> pathlib.Path:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DesktopProtocolError("Installed Codex Desktop package could not be queried") from exc
+        raise DesktopAdapterError("Installed Codex Desktop package query is temporarily unavailable") from exc
     location = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
     package = pathlib.Path(location)
     if result.returncode != 0 or not re.match(r"^OpenAI\.Codex_[0-9].*_x64__[^\\/]+$", package.name, re.I):
@@ -718,11 +718,43 @@ class DesktopAdapter:
     def discover(self):
         with self._lock:
             try:
-                return self._scan()
+                catalog=self._catalog()
+                if len(catalog)>64:
+                    from accounts import LOCALDATA,load_json
+                    try:selected=set(load_json(LOCALDATA/'config.json').get('codex',{}).get('sessions',[]))
+                    except (OSError,ValueError,TypeError):selected=set()
+                    recent=sorted(catalog,key=lambda sid:catalog[sid].get('updated_at_ms') or
+                        (catalog[sid].get('updated_at') or 0)*1000,reverse=True)[:64]
+                    selected.update(recent)
+                    selected.update(sid for sid,g in self._goal_rows.items() if g.get('status') in ('active','usage_limited'))
+                    selected.update(getattr(self,'_last_live_ids',set()))
+                    catalog={sid:data for sid,data in catalog.items() if sid in selected}
+                rows=self._scan(catalog)
+                self._last_live_ids={r['id'] for r in rows}
+                return rows
             except DesktopAdapterError:
                 if isinstance(self._bridge, _BridgeClient):
                     self._bridge.close();self._bridge=None
                 raise
+
+    def request_reopen(self, session_ids):
+        """Retry only native navigation after a pre-submission startup failure."""
+        ids=list(session_ids)
+        if not ids or len(set(ids))!=len(ids) or any(not _UUID.fullmatch(str(sid)) for sid in ids):
+            raise DesktopAdapterError('Invalid original conversation list for reopen')
+        from accounts import LOCALDATA,load_json
+        with self._lock:
+            account=self.accounts.current_desktop_key()
+            if not account or self.accounts.find(account) is None:
+                raise DesktopAdapterError('The saved Codex identity cannot be verified before reopen')
+            setting=load_json(LOCALDATA/'config.json').get('codex',{})
+            if not setting.get('enabled') or not set(ids)<=set(setting.get('sessions',[])):
+                raise DesktopAdapterError('Selected Codex monitoring changed before reopen')
+            if not self._app_control._matching():self._app_control.launch_app()
+            for sid in ids:
+                if self.accounts.current_desktop_key()!=account:
+                    raise DesktopAdapterError('The Codex identity changed before reopen')
+                self._app_control.open_thread(sid)
 
     def selectable_sessions(self, live_rows):
         # Saved chats are selectable even without a live IPC owner. Keep this

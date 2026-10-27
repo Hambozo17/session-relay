@@ -1,6 +1,7 @@
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import closing
 
 from desktop_adapter import (
@@ -206,6 +207,32 @@ class DesktopAdapterTests(unittest.TestCase):
         with self.assertRaises(DesktopProtocolError):
             adapter.discover()
         self.assertFalse(any(call["op"] in ("interrupt", "resume") for call in bridge.calls))
+
+    def test_monitor_prioritizes_selected_old_goal_and_recent_threads(self):
+        bridge=FakeBridge([make_row()]);adapter,accounts,app=self._adapter(bridge)
+        catalog={f'123e4567-e89b-42d3-a456-{i:012d}':{'updated_at':i} for i in range(100)}
+        catalog[THREAD]={'updated_at':-1};old_goal=next(iter(catalog))
+        def saved():
+            adapter._goal_rows={old_goal:{'status':'usage_limited'}}
+            return catalog
+        with patch.object(adapter,'_catalog',side_effect=saved),patch('accounts.load_json',return_value={'codex':{'sessions':[THREAD]}}):
+            adapter.discover()
+        requested=bridge.calls[-1]['threads']
+        self.assertIn(THREAD,requested);self.assertIn(old_goal,requested)
+        self.assertIn('123e4567-e89b-42d3-a456-000000000099',requested)
+        self.assertNotIn('123e4567-e89b-42d3-a456-000000000010',requested)
+        self.assertEqual(app.closed,0);self.assertEqual(accounts.activations,0)
+
+    def test_reopen_retry_only_navigates_original_selected_chat(self):
+        adapter,accounts,app=self._adapter(FakeBridge())
+        app._matching=lambda:True
+        with patch('accounts.load_json',return_value={'codex':{'enabled':True,'sessions':[THREAD]}}):
+            adapter.request_reopen([THREAD])
+        self.assertEqual(app.opened,[THREAD]);self.assertEqual(app.closed,0)
+        self.assertEqual(app.launched,0);self.assertEqual(accounts.activations,0)
+        with patch('accounts.load_json',return_value={'codex':{'enabled':False,'sessions':[THREAD]}}):
+            with self.assertRaises(DesktopAdapterError):adapter.request_reopen([THREAD])
+        self.assertEqual(app.opened,[THREAD])
 
     def test_saved_unowned_chat_is_selectable_but_never_treated_as_live(self):
         self._insert_thread(OTHER_THREAD)

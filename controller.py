@@ -9,7 +9,7 @@ from transcript import permission_policy_equal
 CONFIG = LOCALDATA / 'config.json'
 STATUS = LOCALDATA / 'status.json'
 JOURNAL = LOCALDATA / 'journal.json'
-VERSION = '1.0.20'
+VERSION = '1.0.21'
 
 def config():
     try: return load_json(CONFIG)
@@ -397,12 +397,62 @@ def desktop_pause_superseded_by_running(operation, sessions, current_key):
 def desktop_restart_superseded_by_usage(operation, sessions, current_key):
     from desktop_adapter import pending_desktop_recovery
     contexts=dict(operation.get('recovery_context',{}));changed=False
+    rows={row['id']:row for row in sessions}
+    if any(not desktop_startup_row_verified(contexts.get(sid),rows.get(sid),current_key)
+            for sid in operation.get('sessions',[])):return False
     for row in sessions:
         before=contexts.get(row['id'])
         if (before and row.get('turn_id') and row['turn_id']!=before.get('turn')
                 and not proxy_session(row) and row.get('status')=='failed' and recovery_error(row.get('error_kind'))):
+            if row.get('_screen_quota') or not desktop_startup_new_turn(operation,before,row):return False
             contexts[row['id']]=dict(before,turn=row['turn_id']);changed=True
     return changed and pending_desktop_recovery(dict(operation,recovery_context=contexts),sessions,current_key) is not None
+
+def desktop_startup_goal_preserved(before, row):
+    # A native turn may run while the DB Goal still says usage_limited.
+    # Normalize only active/usage_limited; preserve identity and accounting.
+    from desktop_adapter import DesktopAdapter
+    old=before.get('goal_record');new=row.get('_goal_record')
+    if old is None or new is None:
+        return old is None and new is None and row.get('goal_status') is None
+    if (not all(DesktopAdapter._goal_accounting_valid(g) for g in (old,new))
+            or old.get('status') not in ('active','usage_limited')
+            or new.get('status') not in ('active','usage_limited')
+            or row.get('goal_status')!=new.get('status') or old.get('deferred') or new.get('deferred')):
+        return False
+    return DesktopAdapter._goal_progress_preserved(dict(old,status=new['status']),new)
+
+
+def desktop_startup_row_verified(before, row, current_key):
+    return bool(before and before.get('turn') and before.get('settings') and row
+        and row.get('_owner') and row.get('supported') and row.get('account_key')==current_key
+        and row.get('provider') in (None,'codex') and not proxy_session(row)
+        and not any(row.get(k) for k in ('waiting','is_child','_goal_deferred','_goal_mismatch','_ephemeral'))
+        and row.get('turn_id') and row.get('_settings_fingerprint')==before['settings']
+        and desktop_startup_goal_preserved(before,row))
+
+
+def desktop_startup_new_turn(operation, before, row):
+    stamp=operation.get('updated_at');started=row.get('_turn_started_at_ms')
+    return bool(row.get('turn_id')!=before.get('turn')
+        and all(isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+            for v in (stamp,started)) and started>stamp*1000)
+
+
+def desktop_restart_failed_before_send(operation, sessions, current_key):
+    if (operation.get('phase') not in ('desktop-open-thread-intent','desktop-reopen-intent')
+            or not current_key or current_key!=operation.get('target') or not operation.get('sessions')):
+        return False
+    rows={s['id']:s for s in sessions}
+    for sid in operation['sessions']:
+        row=rows.get(sid);before=operation.get('recovery_context',{}).get(sid)
+        if (not desktop_startup_row_verified(before,row,current_key)
+                or row.get('status')!='failed' or not recovery_error(row.get('error_kind'))
+                or row.get('_screen_quota')
+                or (row['turn_id']!=before['turn'] and not desktop_startup_new_turn(operation,before,row))):
+            return False
+    return True
+
 
 def desktop_restart_superseded_by_later_turns(operation, sessions, current_key):
     # Before any prompt submission, a later verified turn makes the old startup
@@ -411,25 +461,15 @@ def desktop_restart_superseded_by_later_turns(operation, sessions, current_key):
     if (operation.get('phase') not in ('desktop-open-thread-intent','desktop-reopen-intent')
             or not current_key or not operation.get('sessions')
             or not isinstance(operation.get('updated_at'),(int,float))):return False
-    from desktop_adapter import DesktopAdapter
     rows={s['id']:s for s in sessions}
     for sid in operation['sessions']:
         row=rows.get(sid);before=operation.get('recovery_context',{}).get(sid)
-        if (not row or not before or not row.get('_owner') or row.get('account_key')!=current_key
-                or not row.get('supported') or any(row.get(k) for k in
-                    ('waiting','is_child','_goal_deferred','_goal_mismatch','_ephemeral'))
-                or not row.get('turn_id') or row['turn_id']==before.get('turn')
-                or row.get('_settings_fingerprint')!=before.get('settings')
-                or not isinstance(row.get('_turn_started_at_ms'),(int,float))
-                or row['_turn_started_at_ms']<=operation['updated_at']*1000):return False
-        running=row.get('status')=='running' and row.get('goal_status') in (None,'active')
+        if (not desktop_startup_row_verified(before,row,current_key)
+                or not desktop_startup_new_turn(operation,before,row)):return False
+        running=row.get('status')=='running' and row.get('goal_status') in (None,'active','usage_limited')
         failed=(row.get('status')=='failed' and recovery_error(row.get('error_kind'))
-                and not proxy_session(row) and row.get('goal_status') in (None,'active','usage_limited'))
+                and not row.get('_screen_quota') and row.get('goal_status') in (None,'active','usage_limited'))
         if not (running or failed):return False
-        goal=dict(before['goal_record']) if before.get('goal_record') else None
-        if goal and goal.get('status') in ('active','usage_limited'):
-            goal['status']=row.get('goal_status')
-        if not DesktopAdapter._goal_progress_preserved(goal,row.get('_goal_record')):return False
     return True
 
 def desktop_close_superseded_by_completed_turn(operation, sessions, current_key):
@@ -590,6 +630,51 @@ class Controller:
         atomic_json(LOCALDATA / 'operations' / (self.journal['id'] + '.json'), self.journal)
         atomic_json(JOURNAL, self.journal)
 
+    def _retry_desktop_open(self, operation, rows):
+        # Navigation only. Keep the PRE-SEND phase and its timestamp intact so
+        # retries cannot turn an old failure into evidence of a new submission.
+        if operation.get('phase') not in ('desktop-open-thread-intent','desktop-reopen-intent'):return False
+        setting=config().get('codex',{});ids=operation.get('sessions',[])
+        current=self.accounts.current_desktop_key()
+        if (not setting.get('enabled') or not ids or not set(ids)<=set(setting.get('sessions',[]))
+                or not current or current!=operation.get('target') or not self.accounts.find(current)):
+            return False
+        by_id={row['id']:row for row in rows};missing=[]
+        for sid in ids:
+            before=operation.get('recovery_context',{}).get(sid);row=by_id.get(sid)
+            if not before or not before.get('turn') or not before.get('settings'):return False
+            goal=before.get('goal_record')
+            if proxy_session(before.get('settings_snapshot') or {}):return False
+            if not desktop_startup_goal_preserved(before,{'_goal_record':goal,'goal_status':goal.get('status') if goal else None}):return False
+            if row:
+                # Missing ownership alone may be repaired by reopening. Other
+                # observed changes or a manual stop must remain protected.
+                if not desktop_startup_row_verified(before,dict(row,_owner=True),current):return False
+                receipt=operation.get('interruption_receipts',{}).get(sid,{})
+                own_stop=(row.get('status')=='interrupted' and receipt.get('relay_interrupted')
+                    and receipt.get('turn')==row.get('turn_id') and receipt.get('settings')==before['settings'])
+                if not (row.get('status')=='running' or own_stop or
+                        row.get('status')=='failed' and recovery_error(row.get('error_kind'))):return False
+            if not row or not row.get('_owner'):missing.append(sid)
+        if not missing:return False
+        self.keep_awake=True
+        self.attention['codex']='Waiting for original Codex chats to open; retrying every minute.'
+        now=time.time();last=operation.get('desktop_reopen_retry_at')
+        if isinstance(last,(int,float)) and now-last<60:return True
+        try:
+            operation['desktop_reopen_retry_at']=now
+            operation['desktop_reopen_retry_count']=operation.get('desktop_reopen_retry_count',0)+1
+            atomic_json(LOCALDATA/'operations'/(operation['id']+'.json'),operation)
+            if JOURNAL.exists() and load_json(JOURNAL).get('id')==operation['id']:atomic_json(JOURNAL,operation)
+            # Recheck user selection and account immediately before navigation.
+            setting=config().get('codex',{})
+            if (setting.get('enabled') and set(ids)<=set(setting.get('sessions',[]))
+                    and self.accounts.current_desktop_key()==current):
+                self.adapters['codex'].request_reopen(missing)
+        except Exception as exc:
+            self.diagnose('reopening original Codex chats',exc)
+        return True
+
     def _record_completed_quota_failures(self, discovered, settings):
         codex_settings=settings.get('codex',{})
         orca_settings=settings.get('orca',{})
@@ -725,6 +810,7 @@ class Controller:
             row['id'] in cfg.get(app,{}).get('sessions',[]) and row.get('status')=='interrupted' and
             getattr(self.adapters[app],'recovery_receipts',{}).get(row['id'])==(row.get('turn_id'),row.get('_settings_fingerprint'))
             for row in rows) for app,rows in discovered.items())
+        retrying_desktop=False
         for operation in list(self.unresolved):
             app=operation['app'];phase=operation.get('phase');metadata=operation.get('metadata',{})
             safe=phase in ('prepare','desktop-recovery-context')
@@ -735,12 +821,22 @@ class Controller:
             safe=safe or resumed
             safe=safe or superseded
             recovered=(app=='codex' and operation.get('recovery_context') and phase in
-                ('desktop-open-thread-intent','desktop-reopen-intent','desktop-continuation-intent','desktop-session-recovered')
+                ('desktop-continuation-intent','desktop-session-recovered')
                 and desktop_recovery_confirmed(operation,discovered.get(app,[]),self.accounts.current_desktop_key()))
             safe=safe or bool(recovered)
-            later=(app=='codex' and self.accounts.find(self.accounts.current_desktop_key()) is not None
+            setting=config().get(app,{})
+            startup_selected=(setting.get('enabled') and bool(operation.get('sessions'))
+                and set(operation['sessions'])<=set(setting.get('sessions',[])))
+            later=(app=='codex' and startup_selected and self.accounts.find(self.accounts.current_desktop_key()) is not None
                 and desktop_restart_superseded_by_later_turns(operation,discovered.get(app,[]),self.accounts.current_desktop_key()))
             safe=safe or later
+            startup_failed=(app=='codex' and startup_selected and self.accounts.find(self.accounts.current_desktop_key()) is not None
+                and desktop_restart_failed_before_send(operation,discovered.get(app,[]),self.accounts.current_desktop_key()))
+            safe=safe or startup_failed
+            new_startup_failure=bool((later or startup_failed) and self.accounts.current_desktop_key()==operation.get('target')
+                and any(row['id'] in operation['sessions'] and row.get('status')=='failed'
+                    and desktop_startup_new_turn(operation,operation.get('recovery_context',{}).get(row['id'],{}),row)
+                    for row in discovered.get(app,[])))
             finished=(app=='codex' and self.accounts.find(self.accounts.current_desktop_key()) is not None
                 and desktop_close_superseded_by_completed_turn(operation,discovered.get(app,[]),self.accounts.current_desktop_key()))
             safe=safe or finished
@@ -748,15 +844,23 @@ class Controller:
                 from desktop_adapter import pending_desktop_recovery
                 rows=discovered.get(app,[]);current_key=self.accounts.current_desktop_key()
                 pending=pending_desktop_recovery(operation,rows,current_key)
+                if pending is not None:
+                    by_id={row['id']:row for row in rows}
+                    if any(not desktop_startup_row_verified(operation.get('recovery_context',{}).get(sid),by_id.get(sid),current_key)
+                            for sid in operation.get('sessions',[])):pending=None
                 setting=config().get(app,{})
-                if setting.get('enabled') and desktop_restart_superseded_by_usage(operation,rows,current_key):
+                if startup_selected and desktop_restart_superseded_by_usage(operation,rows,current_key):
                     for row in rows:
                         receipt=operation.get('interruption_receipts',{}).get(row['id'],{})
                         if row.get('status')=='interrupted' and receipt.get('relay_interrupted') and receipt.get('turn')==row.get('turn_id') and receipt.get('settings')==row.get('_settings_fingerprint'):
                             self.adapters[app].recovery_receipts[row['id']]=(row['turn_id'],row['_settings_fingerprint'])
                     safe=True
+                    new_startup_failure=any(row['id'] in operation['sessions'] and row.get('status')=='failed'
+                        and desktop_startup_new_turn(operation,operation.get('recovery_context',{}).get(row['id'],{}),row)
+                        for row in rows)
                     self.note('Codex: a new usage/login failure after startup requires another available account.')
-                if pending and setting.get('enabled') and set(pending)<=set(setting.get('sessions',[])):
+                if not safe and self._retry_desktop_open(operation,rows):retrying_desktop=True
+                if not safe and pending and startup_selected:
                     self.keep_awake=True
                     target=self.accounts.find(operation.get('target'))
                     if target:
@@ -779,7 +883,7 @@ class Controller:
                                 operation['recovered_sessions']=list(operation['sessions'])
                                 safe=True;recovered=True
                             except Exception as exc:
-                                operation['state']='needs-attention';self.attention[app]=str(exc)[:180]
+                                operation['state']='needs-attention';self.attention[app]='Codex startup recovery failed; checking again.'
                                 self.diagnose(self.stage,exc);self.save_journal()
             if app == 'orca':
                 # A user may have recovered the chat manually in a new pane.
@@ -819,7 +923,9 @@ class Controller:
                     if not (row.get('goal_status') == 'usage_limited' or (row.get('status') == 'interrupted' and receipt == (row.get('turn_id'), row.get('_settings_fingerprint')))):
                         safe = False; break
             if safe:
-                operation['state']='complete' if recovered else 'reconciled-after-quota-failure' if failed_after_send else 'reconciled-before-continuation'
+                operation['state']='complete' if recovered else 'reconciled-after-quota-failure' if failed_after_send or new_startup_failure else 'reconciled-before-continuation'
+                if startup_failed:
+                    operation['reconciliation']='Verified original owners stopped on quota/login failure before any continuation; reassessing normal recovery.'
                 if failed_after_send:self.note('Orca: continuation reached a new usage/login failure; checking available accounts again.')
                 if finished:
                     operation['reconciliation']='Failed Quit superseded by a later completed native turn with unchanged settings and no active Goal; no restart or continuation replayed.'
@@ -851,7 +957,9 @@ class Controller:
             setting = cfg.get(app, {})
             if not setting.get('enabled'):
                 continue
-            if app in self.attention and app != 'orca':
+            if app in self.attention and app != 'orca' and not (app=='codex' and retrying_desktop
+                    and all(op.get('phase') in ('desktop-open-thread-intent','desktop-reopen-intent')
+                        for op in self.unresolved if op['app']==app)):
                 messages[app] = self.attention[app]; continue
             selected = set(setting.get('sessions', []))
             blocked = {sid for op in self.unresolved if op['app'] == app for sid in op.get('sessions', []) if sid not in op.get('recovered_sessions',[])}

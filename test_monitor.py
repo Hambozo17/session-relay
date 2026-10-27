@@ -1,3 +1,5 @@
+import contextlib
+import copy
 import json
 import pathlib
 import tempfile
@@ -211,12 +213,12 @@ class Monitor(unittest.TestCase):
 
     def test_new_usage_failure_after_verified_restart_releases_stall_but_not_manual_stop(self):
         goal={'goal_id':'original','status':'active','token_budget':1000,'tokens_used':10,'time_used_seconds':1}
-        op={'phase':'desktop-open-thread-intent','target':'active','sessions':['master','chat'],
+        op={'phase':'desktop-open-thread-intent','target':'active','updated_at':10,'sessions':['master','chat'],
             'recovery_context':{'master':{'turn':'original-master','settings':'same','goal_record':goal},'chat':{'turn':'original-chat','settings':'same','goal_record':None}},
             'interruption_receipts':{'chat':{'turn':'original-chat','settings':'same','relay_interrupted':True}}}
         rows=[{'id':'master','status':'failed','error_kind':'usageLimitExceeded','turn_id':'new-master','goal_status':'active','_goal_record':dict(goal,tokens_used=20)},
               {'id':'chat','status':'interrupted','turn_id':'original-chat','_goal_record':None}]
-        for row in rows:row.update(account_key='active',supported=True,_owner='owner',_settings_fingerprint='same')
+        for row in rows:row.update(account_key='active',supported=True,_owner='owner',_settings_fingerprint='same',_turn_started_at_ms=20000)
         self.assertTrue(controller.desktop_restart_superseded_by_usage(op,rows,'active'))
         for changes in ({'status':'interrupted'},{'error_kind':'network_error'},{'_settings_fingerprint':'changed'},{'goal_status':'paused'},{'model_provider':'google-antigravity'}):
             self.assertFalse(controller.desktop_restart_superseded_by_usage(op,[dict(rows[0],**changes),rows[1]],'active'))
@@ -432,5 +434,186 @@ class Monitor(unittest.TestCase):
                         row=a.discover()[0]
                         self.assertEqual(row['status'],'failed');self.assertEqual(row['error_kind'],kind)
                         self.assertTrue(controller.needs_switch(row,{'five_remaining':80,'weekly_remaining':80},2))
+
+class DesktopStartupCycles(unittest.TestCase):
+    @contextlib.contextmanager
+    def environment(self, phase='desktop-open-thread-intent'):
+        with tempfile.TemporaryDirectory() as folder,contextlib.ExitStack() as stack:
+            root=pathlib.Path(folder);now=[1000.0]
+            goal={'goal_id':'original','status':'active','token_budget':1000,'tokens_used':10,
+                'time_used_seconds':2,'created_at_ms':1,'deferred':False}
+            operation={'id':'startup','app':'codex','state':'needs-attention','phase':phase,
+                'sessions':['chat'],'outgoing':'A','target':'B','started_at':890,'updated_at':900,
+                'target_quota':{'allowance_generation':0,'reset_at':None,'weekly_reset_at':None},
+                'recovery_context':{'chat':{'turn':'old','settings':'same','goal_record':copy.deepcopy(goal)}}}
+            row={'id':'chat','account_key':'B','provider':'codex','model_provider':'openai',
+                '_owner':'native-owner','supported':True,'status':'running','turn_id':'new',
+                '_turn_started_at_ms':950000,'goal_status':'usage_limited',
+                '_settings_fingerprint':'same','_goal_record':dict(goal,status='usage_limited',tokens_used=20)}
+            class NativeAccounts:
+                def __init__(self):
+                    self.current='B'
+                    self.records=[{'key':key,'home':str(root/key),'label':key,'sources':['Codex']} for key in ('A','B')]
+                    self.quotas={key:self.quota() for key in ('A','B')}
+                def quota(self,generation=0):
+                    return {'valid':True,'plan':'plus','five_remaining':80,'weekly_remaining':80,
+                        'updated_at':now[0],'_allowance_generation':generation}
+                def inventory(self):return self.records
+                def find(self,key):return next((r for r in self.records if r['key']==key),None)
+                def current_desktop_key(self):return self.current
+                def probe(self,record,**kwargs):return self.quotas[record['key']]
+            accounts=NativeAccounts()
+            class NativeAdapter(Adapter):
+                def __init__(self):
+                    super().__init__([row]);self.calls=[];self.open_error=None
+                def request_reopen(self,ids):
+                    self.calls.append(('open',list(ids)))
+                    if self.open_error:raise self.open_error
+                def rotate(self,ids,target,journal,**kwargs):
+                    self.calls.append(('rotate',list(ids),target['key']))
+                    journal('desktop-recovery-context',{'context':{s['id']:{'turn':s['turn_id'],
+                        'settings':s['_settings_fingerprint'],'goal_record':copy.deepcopy(s['_goal_record'])}
+                        for s in self.rows if s['id'] in ids}})
+                    accounts.current=target['key']
+                    for s in self.rows:
+                        if s['id'] in ids:s.update(account_key=target['key'],status='running',error_kind=None,
+                            turn_id='continued-'+str(len(self.calls)),_turn_started_at_ms=(now[0]+1)*1000)
+                def resume_in_place(self,*args,**kwargs):
+                    self.calls.append(('unexpected-send',))
+                    raise AssertionError('No startup send expected')
+            adapter=NativeAdapter();cfg={'codex':{'enabled':True,'sessions':['chat']},
+                'orca':{'enabled':False,'sessions':[]},'included_resets':False}
+            path=root/'operations/startup.json';path.parent.mkdir();path.write_text(json.dumps(operation))
+            (root/'journal.json').write_text(json.dumps(operation))
+            for name,value in [('LOCALDATA',root),('STATUS',root/'status.json'),('JOURNAL',root/'journal.json')]:
+                stack.enter_context(patch.object(controller,name,value))
+            stack.enter_context(patch.object(controller,'config',return_value=cfg))
+            stack.enter_context(patch.object(controller.time,'time',side_effect=lambda:now[0]))
+            stack.enter_context(patch.object(controller.Controller,'refresh_accounts',return_value=None))
+            instances=[]
+            def restart():
+                c=controller.Controller(accounts,{'codex':adapter,'orca':Adapter([])});instances.append(c);return c
+            try:yield restart(),restart,accounts,adapter,row,root,cfg,now
+            finally:
+                for c in instances:c.refresh_pool.shutdown(wait=True)
+
+    def test_running_new_turn_retires_startup_with_stale_limited_goal_without_send(self):
+        for phase in ('desktop-open-thread-intent','desktop-reopen-intent'):
+            with self.subTest(phase=phase),self.environment(phase) as (c,restart,accounts,adapter,row,root,cfg,now):
+                original=copy.deepcopy(row);c.cycle()
+                self.assertFalse(c.unresolved);self.assertFalse(c.attention);self.assertEqual(adapter.calls,[])
+                self.assertEqual(row,original);self.assertTrue(c.keep_awake)
+                saved=json.loads((root/'operations/startup.json').read_text())
+                self.assertEqual(saved['state'],'reconciled-before-continuation')
+                self.assertEqual(saved['reconciliation_evidence']['turns'],{'chat':'new'})
+                restarted=restart();restarted.cycle();self.assertFalse(restarted.unresolved)
+                self.assertEqual(adapter.calls,[]);self.assertEqual(cfg['codex']['sessions'],['chat'])
+
+    def test_running_retirement_keeps_native_settings_accounting_and_selection_guards(self):
+        changes=[{'waiting':True},{'is_child':True},{'_goal_deferred':True},{'_goal_mismatch':True},
+            {'_ephemeral':True},{'supported':False},{'model_provider':'google-antigravity'},
+            {'_settings_fingerprint':'changed'},{'account_key':'A'},{'turn_id':'old'},
+            {'_turn_started_at_ms':900000},{'_turn_started_at_ms':float('nan')},
+            {'goal_status':'paused'},{'goal_status':'budget_limited'},{'status':'interrupted'}]
+        for changed in changes:
+            with self.subTest(changed=changed),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+                row.update(changed);c.cycle();self.assertEqual(len(c.unresolved),1);self.assertEqual(adapter.calls,[])
+        for field,value in [('goal_id','other'),('token_budget',2000),('tokens_used',9),
+                ('time_used_seconds',1),('tokens_used',float('nan')),('deferred',True)]:
+            with self.subTest(field=field),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+                row['_goal_record'][field]=value;c.cycle();self.assertEqual(len(c.unresolved),1)
+                self.assertEqual(adapter.calls,[])
+        for setting in ({'enabled':False},{'sessions':[]}):
+            with self.subTest(setting=setting),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+                cfg['codex'].update(setting);c.cycle();self.assertEqual(len(c.unresolved),1)
+                self.assertEqual(adapter.calls,[])
+
+    def test_same_old_failure_retires_without_banning_untried_target(self):
+        for kind in ('quota','login'):
+            with self.subTest(kind=kind),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+                row.update(status='failed',error_kind=kind,turn_id='old',_turn_started_at_ms=800000)
+                c.cycle();self.assertFalse(c.unresolved)
+                saved=json.loads((root/'operations/startup.json').read_text())
+                self.assertEqual(saved['state'],'reconciled-before-continuation')
+                self.assertNotIn('B',controller.quota_failed_target_keys('codex',[row],c.recovery_attempts,accounts.quotas))
+                self.assertEqual(adapter.calls,[('rotate',['chat'],'A')])
+
+    def test_new_quota_failure_blocks_bounce_across_restart_until_allowance_reset(self):
+        with self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):
+            row.update(status='failed',error_kind='quota');c.cycle()
+            self.assertEqual(adapter.calls,[('rotate',['chat'],'A')]);self.assertFalse(c.unresolved)
+            saved=json.loads((root/'operations/startup.json').read_text())
+            self.assertEqual(saved['state'],'reconciled-after-quota-failure')
+            self.assertEqual(saved['target_quota']['allowance_generation'],0)
+            now[0]+=5;row.update(status='failed',error_kind='login',turn_id='failed-on-A',_turn_started_at_ms=now[0]*1000)
+            c.cycle();self.assertEqual(len(adapter.calls),1)
+            restarted=restart();restarted.cycle();self.assertEqual(len(adapter.calls),1)
+            self.assertEqual(controller.quota_failed_target_keys('codex',[row],restarted.recovery_attempts,accounts.quotas),{'A','B'})
+            accounts.quotas['B']=accounts.quota(1);restarted.cycle()
+            self.assertEqual(adapter.calls[-1],('rotate',['chat'],'B'));self.assertEqual(len(adapter.calls),2)
+
+    def test_absent_owners_retry_each_minute_and_persist_throttle_and_sanitized_errors(self):
+        with self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):
+            adapter.rows=[];adapter.open_error=RuntimeError('secret native payload');c.cycle()
+            self.assertEqual(adapter.calls,[('open',['chat'])]);self.assertTrue(c.keep_awake)
+            saved=json.loads((root/'operations/startup.json').read_text())
+            self.assertEqual(saved['desktop_reopen_retry_count'],1);self.assertEqual(saved['updated_at'],900)
+            restarted=restart();now[0]+=59;restarted.cycle();self.assertEqual(len(adapter.calls),1)
+            now[0]+=1;restarted.cycle();self.assertEqual(len(adapter.calls),2);self.assertTrue(restarted.keep_awake)
+            saved=json.loads((root/'journal.json').read_text())
+            self.assertEqual(saved['desktop_reopen_retry_count'],2);self.assertEqual(saved['desktop_reopen_retry_at'],1060)
+            for path in root.rglob('*.json*'):self.assertNotIn('secret native payload',path.read_text())
+            adapter.rows=[row];restarted.cycle();self.assertFalse(restarted.unresolved)
+            self.assertEqual(len(adapter.calls),2)
+
+    def test_reopen_retry_blocked_when_disabled_unselected_wrong_account_or_uncertain_send(self):
+        for change in ('disabled','unselected','wrong-account','unknown-account','uncertain-send'):
+            with self.subTest(change=change),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+                adapter.rows=[]
+                if change=='disabled':cfg['codex']['enabled']=False
+                if change=='unselected':cfg['codex']['sessions']=[]
+                if change=='wrong-account':accounts.current='A'
+                if change=='unknown-account':accounts.records=[]
+                if change=='uncertain-send':c.unresolved[0]['phase']='desktop-continuation-intent'
+                c.cycle();self.assertEqual(adapter.calls,[]);self.assertEqual(len(c.unresolved),1)
+
+    def test_failed_startup_never_releases_manual_stop_approval_proxy_or_goal_changes(self):
+        for turn in ('old','new'):
+            for changed in ({'status':'interrupted'},{'waiting':True},{'_goal_deferred':True},
+                    {'model_provider':'google-antigravity'},{'goal_status':'paused'},
+                    {'goal_status':'budget_limited'},{'_settings_fingerprint':'changed'},
+                    {'error_kind':'network_error'}):
+                with self.subTest(turn=turn,changed=changed),self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+                    row.update(status='failed',error_kind='quota',turn_id=turn);row.update(changed)
+                    c.cycle();self.assertEqual(len(c.unresolved),1);self.assertEqual(adapter.calls,[])
+
+    def test_reopen_error_does_not_stop_monitoring_other_selected_chats(self):
+        with self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+            sibling=copy.deepcopy(row);sibling.update(id='other',goal_status='active')
+            sibling['_goal_record']['status']='active'
+            adapter.rows=[sibling];adapter.open_error=RuntimeError('private payload')
+            cfg['codex']['sessions'].append('other');c.cycle()
+            self.assertEqual(adapter.calls,[('open',['chat'])]);self.assertTrue(c.keep_awake)
+            status=json.loads((root/'status.json').read_text())
+            self.assertEqual(status['messages']['codex'],'Monitoring 1 selected chat(s)')
+            self.assertEqual(len(c.unresolved),1)
+
+    def test_ownerless_native_row_reopens_original_thread_and_manual_stop_stays_protected(self):
+        with self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+            row['_owner']=None;c.cycle();self.assertEqual(adapter.calls,[('open',['chat'])])
+            self.assertEqual(len(c.unresolved),1)
+        with self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+            row.update(_owner=None,status='interrupted');c.cycle()
+            self.assertEqual(adapter.calls,[]);self.assertEqual(len(c.unresolved),1)
+
+    def test_one_manual_stop_keeps_entire_original_failure_group_unresolved(self):
+        with self.environment() as (c,_,accounts,adapter,row,root,cfg,now):
+            row.update(status='failed',error_kind='quota')
+            sibling=copy.deepcopy(row);sibling.update(id='other',status='interrupted')
+            adapter.rows.append(sibling);cfg['codex']['sessions'].append('other')
+            operation=c.unresolved[0];operation['sessions'].append('other')
+            operation['recovery_context']['other']=copy.deepcopy(operation['recovery_context']['chat'])
+            c.cycle();self.assertEqual(adapter.calls,[]);self.assertEqual(len(c.unresolved),1)
+
 
 if __name__=='__main__':unittest.main()
