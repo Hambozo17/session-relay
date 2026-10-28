@@ -326,11 +326,18 @@ class DesktopAdapterTests(unittest.TestCase):
                     self.assertEqual((adapter._read_goals().get(THREAD) or {}).get('status'),goal)
 
     def test_restart_continuation_respects_live_revocation_after_launch_and_intent(self):
+        self._restart_revocation()
+
+    def test_blocked_goal_revocation_is_cancelled_before_goal_eligibility_can_block_recovery(self):
+        self._restart_revocation('blocked')
+
+    def _restart_revocation(self,goal=None):
         for stage in ('launch','intent'):
             for change in ({'enabled':False},{'continue_on_stop':False},{'sessions':[]}):
                 with self.subTest(stage=stage,change=change):
-                    before=FakeBridge([make_row(status='idle',runtime_status='idle')])
-                    after=FakeBridge([make_row(status='idle',runtime_status='idle')])
+                    self._write_goal(goal)
+                    before=FakeBridge([make_row(status='idle',runtime_status='idle',goal_status=goal)])
+                    after=FakeBridge([make_row(status='idle',runtime_status='idle',goal_status=goal)])
                     adapter,accounts,app=self._adapter(before,bridges=[after]);phases=[]
                     cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD]}}
                     if stage=='launch':app.on_launch=lambda:cfg['codex'].update(change)
@@ -360,6 +367,40 @@ class DesktopAdapterTests(unittest.TestCase):
                 adapter.rotate([THREAD],accounts.find(NEW_KEY),lambda phase,data:phases.append(phase))
         self.assertEqual(phases[-1],'desktop-continuation-intent')
         self.assertNotIn('desktop-session-recovered',phases)
+
+    def test_first_failed_continuation_reconciles_with_unsent_opted_in_idle_sibling(self):
+        import controller,time
+        self._insert_thread(OTHER_THREAD)
+        class FailedBridge(FakeBridge):
+            def call(self,command,timeout=20):
+                result=super().call(command,timeout)
+                if command['op']=='resume':
+                    row=next(r for r in self.rows if r['id']==command['thread'])
+                    row.update(status='failed',error_kind='usageLimitExceeded',runtime_status='idle',
+                        turn_started_at_ms=(time.time()+1)*1000)
+                    result['session']=dict(row)
+                return result
+        rows=[make_row(status='idle',runtime_status='idle'),make_row(id=OTHER_THREAD,status='idle',runtime_status='idle')]
+        before=FakeBridge(rows);after=FailedBridge(rows);adapter,accounts,app=self._adapter(before,bridges=[after])
+        cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD,OTHER_THREAD]}}
+        with patch.object(controller,'LOCALDATA',self.home),patch.object(controller,'STATUS',self.home/'status.json'),patch.object(controller,'JOURNAL',self.home/'journal.json'):
+            c=controller.Controller(accounts,{})
+            c.journal={'id':'idle-siblings','app':'codex','state':'in-progress','sessions':[THREAD,OTHER_THREAD],
+                'target':NEW_KEY,'outgoing':OLD_KEY,'phase':'prepare','updated_at':time.time(),'target_quota':{}}
+            try:
+                with patch('accounts.load_json',return_value=cfg):
+                    with self.assertRaisesRegex(DesktopAdapterError,'usage/login failure'):
+                        adapter.rotate([THREAD,OTHER_THREAD],accounts.find(NEW_KEY),c.journal_phase)
+                    fresh=adapter._scan(adapter._catalog())
+                saved=controller.load_json(self.home/'operations/idle-siblings.json')
+                self.assertEqual([call['thread'] for call in after.calls if call['op']=='resume'],[THREAD])
+                self.assertTrue(controller.desktop_continuation_failed(saved,fresh,NEW_KEY))
+                other=next(row for row in fresh if row['id']==OTHER_THREAD)
+                for changes in ({'_continue_on_stop':False},{'status':'interrupted'},
+                        {'turn_id':'manual-new'},{'_runtime_status':'active'},{'waiting':True}):
+                    altered=[dict(row,**changes) if row['id']==OTHER_THREAD else row for row in fresh]
+                    self.assertFalse(controller.desktop_continuation_failed(saved,altered,NEW_KEY))
+            finally:c.refresh_pool.shutdown(wait=True)
 
     def test_failed_first_send_keeps_order_and_durable_unsent_pause_receipts(self):
         import controller,time

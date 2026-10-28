@@ -83,7 +83,9 @@ def pending_desktop_recovery(operation, rows, account):
         own_stop=(row.get('status')=='interrupted' and receipt.get('relay_interrupted')
                   and receipt.get('turn')==row.get('turn_id') and receipt.get('settings')==before.get('settings'))
         usage_failure=row.get('status')=='failed' and recovery_error(row.get('error_kind'))
-        if not own_stop and not usage_failure:return None
+        opted_idle=(before.get('continue_on_stop') and row.get('_continue_on_stop') and row.get('status')=='idle'
+            and row.get('_runtime_status') in ('idle','notLoaded') and not proxy_session(row))
+        if not own_stop and not usage_failure and not opted_idle:return None
         pending.append(sid)
     return pending
 
@@ -1217,6 +1219,12 @@ class DesktopAdapter:
                 time.sleep(.5)
             self._assert_safe_group(fresh, ids)
             fresh_by_id = {row["id"]: row for row in fresh}
+            # Revocation is a definite non-send even if restoring an opted-in
+            # blocked Goal would otherwise fail eligibility validation first.
+            for sid in ids:
+                original=originals[sid]
+                self._check_continue_authorization(original,journal_callback,
+                    (sid,original.get('turn_id') or '',target['key']))
             completed_goals=set()
             for sid in ids:
                 row = fresh_by_id.get(sid)
