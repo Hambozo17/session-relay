@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.22
+
+- Resolve a removed Codex Store installation again after an update instead of retaining its obsolete path.
+- Retire an old confirmed pause when newer native work has already resumed or failed, and recover confirmed relay pauses without requiring a Goal.
+- Retry transient owner-discovery reads at lower concurrency so large saved histories can complete verification before account recovery.
+- Refresh delayed native snapshots and retain authorization for chats preserved during a handoff.
+- Reopen enabled selected chats after Codex or Windows restarts, with persistent navigation retries and no automatic prompt for a missing owner.
+- Retry another account after an exact-message continuation is natively confirmed to have failed on usage or login; retain unconfirmed-send protection.
+
 ## 1.0.21
 
 - Recognize verified Git main/worktree root aliases under full access after Codex reopens, while preserving the raw settings and restricted permission checks.

@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from contextlib import closing
+from types import SimpleNamespace
+import desktop_adapter
 
 from desktop_adapter import (
     DesktopAdapter,
@@ -19,6 +21,41 @@ OLD_KEY = "old-account"
 NEW_KEY = "new-account"
 FINGERPRINT = "a" * 64
 OTHER_THREAD = "987e6543-e21b-42d3-a456-426614174000"
+
+
+@unittest.skipUnless(desktop_adapter.os.name=='nt','Windows package discovery')
+class PackageUpdateTests(unittest.TestCase):
+    def test_removed_cached_store_package_is_resolved_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder)
+            old=root/'OpenAI.Codex_26.1021.3705.0_x64__publisher'
+            new=root/'OpenAI.Codex_26.1023.6123.0_x64__publisher'
+            archive=new/'app/resources/app.asar';archive.parent.mkdir(parents=True);archive.write_bytes(b'fixture')
+            with patch.object(desktop_adapter,'_PACKAGE_LOCATION',old),patch.object(desktop_adapter.subprocess,'run',
+                    return_value=SimpleNamespace(returncode=0,stdout=str(new))) as query:
+                self.assertEqual(desktop_adapter._installed_package_location(),new)
+                self.assertEqual(desktop_adapter._installed_package_location(),new)
+                self.assertEqual(query.call_count,1)
+
+    def test_removed_package_query_failure_does_not_poison_next_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            old=pathlib.Path(folder)/'removed'
+            with patch.object(desktop_adapter,'_PACKAGE_LOCATION',old),patch.object(desktop_adapter.subprocess,'run',
+                    side_effect=__import__('subprocess').TimeoutExpired('query',8)):
+                with self.assertRaises(DesktopAdapterError):desktop_adapter._installed_package_location()
+                self.assertIsNone(desktop_adapter._PACKAGE_LOCATION)
+
+    def test_registered_update_replaces_an_old_package_even_while_old_files_remain(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder);old=root/'OpenAI.Codex_1_x64__publisher';new=root/'OpenAI.Codex_2_x64__publisher'
+            for package in (old,new):
+                archive=package/'app/resources/app.asar';archive.parent.mkdir(parents=True);archive.write_bytes(b'fixture')
+                (package/'app/ChatGPT.exe').write_bytes(b'fixture')
+                (package/'AppxManifest.xml').write_text('<Package><Application Id="App" Executable="app/ChatGPT.exe"/><Protocol Name="codex"/></Package>')
+            control=desktop_adapter._WindowsDesktopControl()
+            control._package={'root':old.resolve(),'exe':old/'app/ChatGPT.exe','family':'old','app_id':'App'}
+            with patch.object(desktop_adapter,'_PACKAGE_LOCATION',old),patch.object(desktop_adapter,'_PACKAGE_CHECKED_AT',0),patch.object(desktop_adapter.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=str(new))):
+                self.assertEqual(control.package()['root'],new.resolve())
 
 
 class QuitWindowTests(unittest.TestCase):
@@ -222,6 +259,44 @@ class DesktopAdapterTests(unittest.TestCase):
         self.assertIn('123e4567-e89b-42d3-a456-000000000099',requested)
         self.assertNotIn('123e4567-e89b-42d3-a456-000000000010',requested)
         self.assertEqual(app.closed,0);self.assertEqual(accounts.activations,0)
+
+    def test_in_place_recovery_accepts_only_a_confirmed_relay_pause(self):
+        bridge=FakeBridge([make_row(status='interrupted',runtime_status='idle')])
+        adapter,accounts,app=self._adapter(bridge)
+        with self.assertRaises(DesktopAdapterError):adapter.resume_in_place([THREAD],lambda *_:None)
+        self.assertFalse(any(call['op']=='resume' for call in bridge.calls))
+        adapter.recovery_receipts[THREAD]=('turn-1',FINGERPRINT)
+        self.assertEqual(adapter.resume_in_place([THREAD],lambda *_:None),[THREAD])
+        self.assertEqual(len([c for c in bridge.calls if c['op']=='resume']),1)
+        self.assertEqual(app.closed,0);self.assertEqual(accounts.activations,0)
+
+    def test_failed_first_send_keeps_order_and_durable_unsent_pause_receipts(self):
+        import controller,time
+        self._insert_thread(OTHER_THREAD)
+        bridge=FakeBridge([make_row(id=OTHER_THREAD,status='interrupted',runtime_status='idle'),
+            make_row(status='interrupted',runtime_status='idle')])
+        adapter,accounts,app=self._adapter(bridge)
+        adapter.recovery_receipts={sid:('turn-1',FINGERPRINT) for sid in (THREAD,OTHER_THREAD)}
+        original_call=bridge.call
+        def call(command,**kwargs):
+            if command['op']!='resume':return original_call(command,**kwargs)
+            bridge.calls.append(dict(command))
+            row=next(row for row in bridge.rows if row['id']==command['thread'])
+            row.update(status='failed',error_kind='usageLimitExceeded',turn_id='new-failed',
+                client_user_message_id=command['operation_id'],turn_started_at_ms=(time.time()+1)*1000)
+            raise DesktopUncertainError('Accepted send failed before confirmation')
+        bridge.call=call
+        with patch.object(controller,'LOCALDATA',self.home),patch.object(controller,'STATUS',self.home/'status.json'),patch.object(controller,'JOURNAL',self.home/'journal.json'):
+            c=controller.Controller(accounts,{})
+            c.journal={'id':'in-place','app':'codex','state':'in-progress','sessions':[THREAD,OTHER_THREAD],
+                'target':OLD_KEY,'outgoing':OLD_KEY,'phase':'prepare','target_quota':{'allowance_generation':0}}
+            try:
+                with self.assertRaises(DesktopUncertainError):adapter.resume_in_place([THREAD,OTHER_THREAD],c.journal_phase)
+                saved=controller.load_json(self.home/'operations/in-place.json')
+                self.assertEqual([x['thread'] for x in bridge.calls if x['op']=='resume'],[THREAD])
+                self.assertEqual(set(saved['interruption_receipts']),{THREAD,OTHER_THREAD})
+                self.assertTrue(controller.desktop_continuation_failed(saved,adapter._scan(adapter._catalog()),OLD_KEY))
+            finally:c.refresh_pool.shutdown(wait=True)
 
     def test_reopen_retry_only_navigates_original_selected_chat(self):
         adapter,accounts,app=self._adapter(FakeBridge())

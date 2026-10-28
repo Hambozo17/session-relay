@@ -29,6 +29,83 @@ class Adapter:
     def discover(self): return self.rows
 
 class Monitor(unittest.TestCase):
+    def test_missing_selected_owner_reopens_once_per_minute_across_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder);now=[1000.0];accounts=Accounts();accounts.current_desktop_key=lambda:'active'
+            class NativeAdapter(Adapter):
+                def __init__(self):super().__init__([]);self.opened=[]
+                def request_reopen(self,ids):self.opened.append(list(ids))
+            adapter=NativeAdapter();cfg={'codex':{'enabled':True,'sessions':['chat']},'orca':{'enabled':False}}
+            with patch.object(controller,'LOCALDATA',root),patch.object(controller,'STATUS',root/'status.json'),patch.object(controller,'JOURNAL',root/'journal.json'),patch.object(controller,'config',return_value=cfg),patch.object(controller.time,'time',side_effect=lambda:now[0]),patch.object(controller.Controller,'refresh_accounts',return_value=None):
+                first=controller.Controller(accounts,{'codex':adapter,'orca':Adapter([])})
+                second=None
+                try:
+                    first.cycle();first.cycle();self.assertEqual(adapter.opened,[['chat']]);self.assertTrue(first.keep_awake)
+                    second=controller.Controller(accounts,{'codex':adapter,'orca':Adapter([])})
+                    second.cycle();self.assertEqual(adapter.opened,[['chat']])
+                    now[0]+=61;second.cycle();self.assertEqual(adapter.opened,[['chat'],['chat']])
+                    adapter.rows=[{'id':'chat','status':'idle','account_key':'active','goal_status':'blocked'}]
+                    now[0]+=61;second.cycle();self.assertEqual(adapter.opened,[['chat'],['chat']])
+                finally:
+                    first.refresh_pool.shutdown(wait=True)
+                    if second:second.refresh_pool.shutdown(wait=True)
+
+    def test_attachment_retry_respects_disabled_unknown_protocol_and_uncertain_send(self):
+        from desktop_adapter import DesktopAdapterError,DesktopProtocolError
+        for mode in ('disabled','unknown','protocol','uncertain','closed'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as folder:
+                root=pathlib.Path(folder);accounts=Accounts();accounts.current_desktop_key=lambda:'missing' if mode=='unknown' else 'active'
+                class NativeAdapter(Adapter):
+                    def __init__(self):super().__init__([]);self.opened=[]
+                    def request_reopen(self,ids):self.opened.append(list(ids))
+                    def discover(self):
+                        if mode=='protocol':raise DesktopProtocolError('incompatible')
+                        if mode=='closed':raise DesktopAdapterError('owner pipe unavailable')
+                        return []
+                if mode=='uncertain':
+                    (root/'operations').mkdir()
+                    (root/'operations/pending.json').write_text(json.dumps({'id':'pending','app':'codex','state':'needs-attention',
+                        'phase':'desktop-continuation-intent','sessions':['chat'],'target':'active'}))
+                cfg={'codex':{'enabled':mode!='disabled','sessions':['chat']},'orca':{'enabled':False}}
+                with patch.object(controller,'LOCALDATA',root),patch.object(controller,'STATUS',root/'status.json'),patch.object(controller,'JOURNAL',root/'journal.json'),patch.object(controller,'config',return_value=cfg),patch.object(controller.Controller,'refresh_accounts',return_value=None):
+                    adapter=NativeAdapter();c=controller.Controller(accounts,{'codex':adapter,'orca':Adapter([])})
+                    try:c.cycle();self.assertEqual(adapter.opened,[['chat']] if mode=='closed' else [])
+                    finally:c.refresh_pool.shutdown(wait=True)
+
+    def test_confirmed_pause_without_goal_reenters_recovery_after_restart(self):
+        for preserved in (False,True):
+            with self.subTest(preserved=preserved):self._confirmed_pause_without_goal(preserved)
+
+    def _confirmed_pause_without_goal(self,preserved):
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder);(root/'operations').mkdir()
+            context={'turn':'paused-turn','settings':'same','goal_record':None}
+            operation={'id':'confirmed-no-goal','app':'codex','state':'needs-attention',
+                'phase':'desktop-interrupt-confirmed','sessions':['chat'],'outgoing':'active','target':'other',
+                'recovery_context':{'chat':context},
+                'metadata':{'session':'chat','turn':'paused-turn','settings':'same','account':'active','goal':None},
+                'interruption_receipts':{'chat':dict(context,goal=None,relay_interrupted=True)}}
+            if preserved:
+                operation['sessions'].append('sibling')
+                operation['recovery_context']['sibling']=dict(context)
+                operation['interruption_receipts']['sibling']=dict(context,goal=None,relay_interrupted=True)
+                operation['metadata']['session']='sibling'
+            (root/'operations/confirmed-no-goal.json').write_text(json.dumps(operation))
+            row={'id':'chat','account_key':'active','_owner':'owner','supported':True,'status':'interrupted',
+                'turn_id':'paused-turn','goal_status':None,'_settings_fingerprint':'same','_goal_record':None}
+            class ResumingAdapter(Adapter):
+                def resume_in_place(self,ids,journal):self.resumed=list(ids)
+            accounts=Accounts();accounts.current_desktop_key=lambda:'active'
+            target={'key':'other','home':'other','label':'other','sources':[]};accounts.records.append(target)
+            cfg={'codex':{'enabled':True,'sessions':['chat'],'preserve_running':preserved},'orca':{'enabled':False}}
+            with patch.object(controller,'LOCALDATA',root),patch.object(controller,'STATUS',root/'status.json'),patch.object(controller,'JOURNAL',root/'journal.json'),patch.object(controller,'config',return_value=cfg),patch.object(controller,'choose_destination',return_value=(target,False)):
+                adapter=ResumingAdapter([row]+([dict(row,id='sibling')] if preserved else []));c=controller.Controller(accounts,{'orca':Adapter([]),'codex':adapter});c.refresh_started=time.time()
+                try:
+                    c.cycle();self.assertEqual(adapter.resumed,['chat','sibling'] if preserved else ['chat'])
+                    self.assertEqual(adapter.recovery_receipts['chat'],('paused-turn','same'))
+                    self.assertFalse(c.unresolved);self.assertNotIn('codex',c.attention)
+                finally:c.refresh_pool.shutdown(wait=True)
+
     def test_orca_reconciliation_keeps_unverified_resumed_turns_blocked_across_restart(self):
         original={'id':'chat','turn_id':'before','model':'chosen','effort':'high',
             'approval_policy':'never','sandbox_policy':{'type':'danger-full-access'},
@@ -108,9 +185,13 @@ class Monitor(unittest.TestCase):
         self.assertFalse(controller.desktop_restart_superseded_by_later_turns(dict(op,sessions=['chat','missing']),[row],'third'))
 
     def test_old_startup_failure_no_longer_blocks_current_selected_quota_recovery(self):
+        for phase in ('desktop-open-thread-intent','desktop-interrupt-confirmed'):
+            with self.subTest(phase=phase):self._old_intent_current_quota_recovery(phase)
+
+    def _old_intent_current_quota_recovery(self,phase):
         with tempfile.TemporaryDirectory() as folder:
             root=pathlib.Path(folder);(root/'operations').mkdir()
-            op={'id':'stale','app':'codex','state':'needs-attention','phase':'desktop-open-thread-intent',
+            op={'id':'stale','app':'codex','state':'needs-attention','phase':phase,
                 'updated_at':10,'outgoing':'first','target':'second','sessions':['chat'],
                 'recovery_context':{'chat':{'turn':'before','settings':'same','goal_record':None}}}
             (root/'operations/stale.json').write_text(json.dumps(op))
@@ -529,6 +610,62 @@ class DesktopStartupCycles(unittest.TestCase):
                 restarted=restart();restarted.cycle();self.assertFalse(restarted.unresolved)
                 self.assertEqual(adapter.calls,[]);self.assertEqual(cfg['codex']['sessions'],['chat'])
 
+    def test_exact_native_failed_send_retries_another_account_without_replaying_message(self):
+        for kind in ('quota','login'):
+            with self.subTest(kind=kind),self.environment('desktop-continuation-intent') as (c,restart,accounts,adapter,row,root,cfg,now):
+                operation=c.unresolved[0]
+                operation['metadata']={'session':'chat','turn':'old','settings':'same','operation':'exact-message'}
+                row.update(status='failed',error_kind=kind,_client_user_message_id='exact-message')
+                for file in (root/'operations/startup.json',root/'journal.json'):file.write_text(json.dumps(operation))
+                c.cycle();self.assertFalse(c.unresolved)
+                self.assertEqual(adapter.calls,[('rotate',['chat'],'A')])
+                saved=json.loads((root/'operations/startup.json').read_text())
+                self.assertEqual(saved['state'],'reconciled-after-quota-failure')
+                self.assertIn('B',controller.quota_failed_target_keys('codex',[row],c.recovery_attempts,accounts.quotas))
+                restarted=restart();restarted.cycle()
+                self.assertEqual(adapter.calls,[('rotate',['chat'],'A')])
+
+    def test_failed_send_with_unrelated_or_unknown_native_message_stays_blocked(self):
+        for change in ({'_client_user_message_id':None},{'_client_user_message_id':'other'},
+                {'_settings_fingerprint':'changed'},{'_turn_started_at_ms':800000},
+                {'waiting':True},{'error_kind':'network_error'}):
+            with self.subTest(change=change),self.environment('desktop-continuation-intent') as (c,_,accounts,adapter,row,root,cfg,now):
+                c.unresolved[0]['metadata']={'session':'chat','turn':'old','settings':'same','operation':'exact-message'}
+                row.update(status='failed',error_kind='quota',_client_user_message_id='exact-message');row.update(change)
+                c.cycle();self.assertEqual(len(c.unresolved),1);self.assertEqual(adapter.calls,[])
+
+    def test_exact_failed_send_keeps_unchanged_unsent_siblings_recoverable(self):
+        with self.environment('desktop-continuation-intent') as (c,restart,accounts,adapter,row,root,cfg,now):
+            sibling=self.add_paused_sibling(c,adapter,row,root,cfg)
+            operation=c.unresolved[0]
+            operation['metadata']={'session':'chat','turn':'old','settings':'same','operation':'exact-message'}
+            row.update(status='failed',error_kind='quota',_client_user_message_id='exact-message')
+            c.cycle();self.assertFalse(c.unresolved)
+            self.assertEqual(adapter.calls,[('rotate',['chat',sibling['id']],'A')])
+            saved=json.loads((root/'operations/startup.json').read_text())
+            self.assertEqual(saved['verified_interruption_accounts'][sibling['id']],'B')
+
+    def test_mixed_failure_retains_adopted_account_window_and_working_receipts_before_send(self):
+        from desktop_adapter import DesktopUncertainError
+        with self.environment('desktop-interrupt-confirmed') as (c,restart,accounts,adapter,row,root,cfg,now):
+            sibling=self.add_paused_sibling(c,adapter,row,root,cfg)
+            accounts.current='A';row['account_key']=sibling['account_key']='A'
+            accounts.quotas['A']=accounts.quota(2);cfg['codex']['preserve_running']=True
+            operation=c.unresolved[0];operation['metadata']={'session':sibling['id'],'turn':'old-sibling','settings':'same','account':'A'}
+            adapter.send_error=DesktopUncertainError('send result not yet observed')
+            c.cycle();saved=json.loads((root/'operations/startup.json').read_text())
+            self.assertEqual(saved['phase'],'desktop-continuation-intent')
+            self.assertEqual(saved['state'],'needs-attention');self.assertEqual(len(c.unresolved),1)
+            self.assertEqual(saved['target'],'A');self.assertEqual(saved['target_quota']['allowance_generation'],2)
+            self.assertEqual(saved['recovered_sessions'],['chat'])
+            self.assertEqual(saved['continuation_order'],['chat',sibling['id']])
+            c.cycle();restarted=restart();restarted.cycle()
+            self.assertEqual(adapter.calls,[('resume',sibling['id'])]);self.assertEqual(len(restarted.unresolved),1)
+            now[0]+=1;sibling.update(status='failed',error_kind='quota',turn_id='failed-send',
+                _turn_started_at_ms=now[0]*1000,_client_user_message_id=saved['metadata']['operation'])
+            adapter.send_error=None;restarted.cycle();self.assertFalse(restarted.unresolved)
+            self.assertEqual(adapter.calls,[('resume',sibling['id']),('rotate',[sibling['id'],'chat'],'B')])
+
     def test_running_retirement_keeps_native_settings_accounting_and_selection_guards(self):
         changes=[{'waiting':True},{'is_child':True},{'_goal_deferred':True},{'_goal_mismatch':True},
             {'_ephemeral':True},{'supported':False},{'model_provider':'google-antigravity'},
@@ -591,6 +728,21 @@ class DesktopStartupCycles(unittest.TestCase):
             self.assertEqual(saved['target_quota']['allowance_generation'],2)
             restarted=restart();restarted.cycle();self.assertFalse(restarted.unresolved)
             self.assertEqual(adapter.calls,[('resume',sibling['id'])])
+
+    def test_confirmed_phase_recovers_preserved_sibling_and_verified_new_turn(self):
+        for status in ('running','failed'):
+            for legacy in (False,True):
+                with self.subTest(status=status,legacy=legacy),self.environment('desktop-interrupt-confirmed') as (c,restart,accounts,adapter,row,root,cfg,now):
+                    sibling=self.add_paused_sibling(c,adapter,row,root,cfg)
+                    cfg['codex'].update(sessions=['chat'],preserve_running=True)
+                    operation=c.unresolved[0]
+                    operation['metadata']={'session':'chat','turn':'old','settings':'same','account':'A'}
+                    if not legacy:operation.update(requested_sessions=['chat'],preserved_sessions=[sibling['id']])
+                    if status=='failed':row.update(status='failed',error_kind='quota')
+                    c.cycle();self.assertFalse(c.unresolved);self.assertNotIn('codex',c.attention)
+                    expected=[('resume',sibling['id'])] if status=='running' else [('rotate',['chat',sibling['id']],'A')]
+                    self.assertEqual(adapter.calls,expected)
+                    self.assertEqual(cfg['codex']['sessions'],['chat'])
 
     def test_mixed_new_quota_failure_preserves_confirmed_sibling_and_blocks_target(self):
         with self.environment() as (c,restart,accounts,adapter,row,root,cfg,now):

@@ -28,6 +28,7 @@ _SETTINGS = (
 _QUOTA_ERRORS = {"usageLimitExceeded", "quota", "login", "rate_limit_exceeded"}
 _ACTIVE_GOALS = {None, "active", "usage_limited"}
 _PACKAGE_LOCATION: pathlib.Path | None = None
+_PACKAGE_CHECKED_AT = 0.0
 
 
 class DesktopAdapterError(RuntimeError):
@@ -85,9 +86,13 @@ def pending_desktop_recovery(operation, rows, account):
 
 
 def _installed_package_location() -> pathlib.Path:
-    global _PACKAGE_LOCATION
-    if _PACKAGE_LOCATION is not None:
+    global _PACKAGE_LOCATION, _PACKAGE_CHECKED_AT
+    if (_PACKAGE_LOCATION is not None and time.monotonic()-_PACKAGE_CHECKED_AT<60
+            and (_PACKAGE_LOCATION / 'app' / 'resources' / 'app.asar').is_file()):
         return _PACKAGE_LOCATION
+    # Store updates remove the previous package while the monitor stays alive.
+    # Re-resolve a removed package instead of rejecting every subsequent cycle.
+    _PACKAGE_LOCATION = None
     if os.name != "nt":
         raise DesktopProtocolError("Codex Desktop recovery requires Windows")
     powershell = shutil.which("powershell.exe") or str(pathlib.Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
@@ -107,6 +112,7 @@ def _installed_package_location() -> pathlib.Path:
     if not (package / "app" / "resources" / "app.asar").is_file():
         raise DesktopProtocolError("Installed Codex Desktop protocol source is unavailable")
     _PACKAGE_LOCATION = package
+    _PACKAGE_CHECKED_AT = time.monotonic()
     return package
 
 
@@ -251,9 +257,10 @@ class _WindowsDesktopControl:
         self._package = None
 
     def package(self):
-        if self._package:
-            return self._package
         candidate = _installed_package_location()
+        if (self._package and self._package['root']==candidate.resolve()
+                and self._package['exe'].is_file() and (candidate/'AppxManifest.xml').is_file()):
+            return self._package
         manifest = candidate / "AppxManifest.xml"
         executable = candidate / "app" / "ChatGPT.exe"
         try:
@@ -737,18 +744,26 @@ class DesktopAdapter:
                     self._bridge.close();self._bridge=None
                 raise
 
-    def request_reopen(self, session_ids):
+    def request_reopen(self, session_ids, recovery_operation=None):
         """Retry only native navigation after a pre-submission startup failure."""
         ids=list(session_ids)
         if not ids or len(set(ids))!=len(ids) or any(not _UUID.fullmatch(str(sid)) for sid in ids):
             raise DesktopAdapterError('Invalid original conversation list for reopen')
         from accounts import LOCALDATA,load_json
         with self._lock:
+            catalog=self._catalog()
+            if any(sid not in catalog or catalog[sid].get('archived') or catalog[sid].get('is_archived') for sid in ids):
+                raise DesktopAdapterError('The selected saved Codex conversation is unavailable')
             account=self.accounts.current_desktop_key()
             if not account or self.accounts.find(account) is None:
                 raise DesktopAdapterError('The saved Codex identity cannot be verified before reopen')
             setting=load_json(LOCALDATA/'config.json').get('codex',{})
-            if not setting.get('enabled') or not set(ids)<=set(setting.get('sessions',[])):
+            allowed=setting.get('enabled') and set(ids)<=set(setting.get('sessions',[]))
+            if recovery_operation is not None:
+                from controller import desktop_operation_selected
+                allowed=(desktop_operation_selected(recovery_operation,setting)
+                    and set(ids)<=set(recovery_operation.get('sessions',[])) and recovery_operation.get('target')==account)
+            if not allowed:
                 raise DesktopAdapterError('Selected Codex monitoring changed before reopen')
             if not self._app_control._matching():self._app_control.launch_app()
             for sid in ids:
@@ -911,13 +926,14 @@ class DesktopAdapter:
         }
 
     def resume_in_place(self, session_ids, journal_callback, recovery_operation=None):
-        """Recover an older quota failure after a verified account handoff."""
+        """Recover a known quota failure or a confirmed relay pause."""
         ids = list(session_ids)
         if not ids or len(set(ids)) != len(ids) or any(not _UUID.fullmatch(str(x)) for x in ids):
             raise DesktopAdapterError('The selected Codex conversation list is invalid')
         with self._lock:
             before = self._scan(self._catalog())
-            selected = [s for s in before if s['id'] in ids]
+            by_id={s['id']:s for s in before}
+            selected = [by_id[sid] for sid in ids if sid in by_id]
             account = self.accounts.current_desktop_key()
             if recovery_operation is not None:
                 if not set(ids) <= set(recovery_operation.get('sessions',[])):
@@ -930,11 +946,18 @@ class DesktopAdapter:
             self._validate_selected(selected, ids)
             for s in selected:
                 kind = ''.join(c for c in str(s.get('error_kind') or '').lower() if c.isalnum())
-                if recovery_operation is None and (s['status'] != 'failed' or kind not in ('quota','usagelimitexceeded','ratelimitexceeded') or s.get('goal_status') not in (None,'active')):
+                known_pause=(s['status']=='interrupted' and self.recovery_receipts.get(s['id'])==
+                    (s['turn_id'],s['_settings_fingerprint']))
+                if recovery_operation is None and (not known_pause and (s['status'] != 'failed' or kind not in ('quota','usagelimitexceeded','ratelimitexceeded')) or s.get('goal_status') not in (None,'active')):
                     raise DesktopAdapterError('Only a known quota failure can continue without restarting Codex')
-            if recovery_operation is None:self._safe_journal(journal_callback, 'desktop-recovery-context', {'context': {
-                s['id']: {'turn':s.get('turn_id'),'settings':s.get('_settings_fingerprint'),'settings_snapshot':s.get('_settings'),
-                    'goal_record':s.get('_goal_record')} for s in selected}})
+            if recovery_operation is None:
+                pauses={s['id']:{'turn':s['turn_id'],'settings':s['_settings_fingerprint'],
+                    'goal':s.get('goal_status'),'goal_record':s.get('_goal_record'),'relay_interrupted':True}
+                    for s in selected if s['status']=='interrupted' and
+                    self.recovery_receipts.get(s['id'])==(s['turn_id'],s['_settings_fingerprint'])}
+                self._safe_journal(journal_callback, 'desktop-recovery-context', {'context': {
+                    s['id']: {'turn':s.get('turn_id'),'settings':s.get('_settings_fingerprint'),'settings_snapshot':s.get('_settings'),
+                        'goal_record':s.get('_goal_record')} for s in selected},'interruption_receipts':pauses,'account':account})
             recovered = []
             for s in selected:
                 if self.accounts.current_desktop_key() != account:
@@ -1030,7 +1053,7 @@ class DesktopAdapter:
                     'goal':session.get('goal_status'),'goal_record':session.get('_goal_record'),
                     'confirmation':result.get('confirmation','native-acknowledgement'),
                 })
-            after_pause = self._scan(self._catalog(), wait_ms=1000)
+            after_pause = self._scan(self._catalog(), wait_ms=5000)
             self._assert_safe_group(after_pause, ids)
             paused_by_id = {row["id"]: row for row in after_pause}
             for sid in ids:

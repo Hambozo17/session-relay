@@ -576,12 +576,29 @@ class Bridge {
     if (!Array.isArray(ids) || ids.length > MAX_THREADS) throw error('local conversation inventory is incomplete', 'incompatible');
     const unique = Array.from(new Set(ids.map(validId)));
     for (const id of unique) this.states.delete(id);
-    const ownerLimit = Number.isInteger(options.owner_limit) ? Math.max(1, Math.min(48, options.owner_limit)) : 48;
+    const ownerLimit = Number.isInteger(options.owner_limit) ? Math.max(1, Math.min(48, options.owner_limit)) : 16;
     const ownerTimeout = Number.isInteger(options.owner_timeout_ms) ? Math.max(250, Math.min(10000, options.owner_timeout_ms)) : 1800;
+    const ownerDeadline = Date.now() + 45000;
+    const readOwner = async (id, timeout) => {
+      const remaining = ownerDeadline - Date.now();
+      if (remaining <= 0) throw error('owner inventory read deadline reached', 'timeout');
+      return this.ownerFor(id, Math.min(remaining, timeout));
+    };
     const rows = await mapLimit(unique, ownerLimit, async (id) => {
-      try { return { id, owner: await this.ownerFor(id, ownerTimeout) }; }
+      try { return { id, owner: await readOwner(id, ownerTimeout) }; }
       catch (cause) { return { id, error: cause.kind || 'unavailable' }; }
     });
+    // Large saved histories can briefly overload owner discovery. Retry only
+    // failed READS at lower concurrency; never treat a timeout as no owner.
+    const retry = rows.filter(row => ['timeout', 'overloaded'].includes(row.error));
+    if (retry.length <= 64) {
+      await mapLimit(retry, 4, async (row) => {
+        try {
+          row.owner = await readOwner(row.id, Math.max(ownerTimeout, 5000));
+          delete row.error;
+        } catch (cause) { row.error = cause.kind || 'unavailable'; }
+      });
+    }
     if (!this.compatible) throw error('installed Desktop IPC protocol is incompatible', 'incompatible');
     const owned = rows.filter((row) => row.owner);
     for (const row of owned) this.follow(row.id, true);
@@ -591,6 +608,18 @@ class Bridge {
         const state = this.states.get(row.id);
         return !state || state.owner !== row.owner;
       })) break;
+      await delay(75);
+    }
+    // Refresh only missing snapshots. A busy owner may need longer than the
+    // short post-interrupt scan, even after ownership itself was confirmed.
+    const missing = owned.filter(row => {
+      const state = this.states.get(row.id);
+      return !state || state.owner !== row.owner;
+    });
+    for (const row of missing) this.follow(row.id, true);
+    const retryUntil = Math.min(ownerDeadline + 10000, Date.now() + 5000);
+    while (missing.length && Date.now() < retryUntil) {
+      if (missing.every(row => this.states.get(row.id)?.owner === row.owner)) break;
       await delay(75);
     }
     const sessions = [];
@@ -605,7 +634,7 @@ class Bridge {
       }
     }
     const errors = {};
-    for (const row of rows) if (row.error) errors[row.error] = (errors[row.error] || 0) + 1;
+    for (const row of unresolved) errors[row.reason] = (errors[row.reason] || 0) + 1;
     return {
       compatible: this.compatible,
       sessions,

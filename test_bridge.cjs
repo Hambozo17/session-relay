@@ -5,6 +5,34 @@ const {Bridge, summarize, applyPatches} = require('./desktop_bridge.cjs');
 const id = '123e4567-e89b-42d3-a456-426614174000';
 const operation = '987e6543-e21b-42d3-a456-426614174000';
 
+test('owner discovery retries transient reads and preserves unresolved ownership', async () => {
+  for (const succeeds of [true,false]) {
+    const bridge=new Bridge(()=>{});bridge.compatible=true;
+    const attempts=[];
+    bridge.ownerFor=async (_,timeout)=>{
+      attempts.push(timeout);
+      if (attempts.length===1 || !succeeds) { const e=new Error();e.kind='timeout';throw e; }
+      return null;
+    };
+    const result=await bridge.scan([id],0);
+    assert.equal(attempts.length,2);assert.ok(attempts[1]>=5000);
+    assert.equal(result.unresolved.length,succeeds?0:1);
+    assert.equal(result.diagnostics.owner_null,succeeds?1:0);
+    assert.equal(bridge.attempts.size,0);
+  }
+});
+
+test('a delayed owner snapshot is refreshed without a mutation', async () => {
+  const bridge=new Bridge(()=>{});bridge.compatible=true;
+  bridge.ownerFor=async()=>'owner';let follows=0;
+  bridge.follow=()=>{
+    if (++follows===2) bridge.states.set(id,{owner:'owner',state:{id,turns:[],threadRuntimeStatus:'idle'}});
+  };
+  const result=await bridge.scan([id],0);
+  assert.equal(follows,2);assert.equal(result.unresolved.length,0);
+  assert.equal(result.sessions.length,1);assert.equal(bridge.attempts.size,0);
+});
+
 test('full-access descendant root removal preserves coverage and raw settings', () => {
   const state={id,turns:[],latestModel:'chosen',latestReasoningEffort:'xhigh',
     permissions:{sandboxPolicy:{type:'dangerFullAccess'},runtimeWorkspaceRoots:['C:/work','C:/work/project']}};

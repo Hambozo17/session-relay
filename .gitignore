@@ -24,6 +24,7 @@ quota-cache.json
 account-inventory.json
 orca-bindings.json
 pending-quota.json
+desktop-attach-retries.json
 monitor-health.json
 journal.json
 operations/
