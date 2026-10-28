@@ -7,7 +7,7 @@ from local_rpc import HIDDEN
 from watchdog import ensure_monitor
 
 ROOT = pathlib.Path(__file__).resolve().parent
-PANEL_VERSION = '1.0.22'
+PANEL_VERSION = '1.0.23'
 
 
 def window_geometry(root):
@@ -128,23 +128,25 @@ class Panel:
         account_scroll_x.grid(row=1,column=0,sticky='ew')
         self.accounts_page.bind('<Configure>',lambda event:self.account_heading.configure(wraplength=max(160,event.width)))
 
-        self.options_page.columnconfigure(0,weight=1);self.options_page.rowconfigure(4,weight=1)
+        self.options_page.columnconfigure(0,weight=1);self.options_page.rowconfigure(5,weight=1)
         tk.Label(self.options_page,text='Automation preferences',bg='#101827',fg='#f4f6fc',
             font=('Segoe UI',12,'bold')).grid(row=0,column=0,sticky='w',pady=(12,8))
         initial=config()
         self.resets=tk.BooleanVar(value=initial.get('included_resets',False))
         self.preserve_running=tk.BooleanVar(value=initial.get('codex',{}).get('preserve_running',False))
+        self.continue_on_stop=tk.BooleanVar(value=initial.get('codex',{}).get('continue_on_stop',False))
         self.option_controls=[]
         for row,(label,variable,option) in enumerate((
                 ('Use included resets only when ALL accounts have 0% weekly allowance',self.resets,'included_resets'),
-                ('Preserve all running Codex chats during app restart',self.preserve_running,'preserve_running')),start=1):
+                ('Preserve all running Codex chats during app restart',self.preserve_running,'preserve_running'),
+                ('Send Continue when selected Codex chats stop (3-minute retry delay; no Goal required)',self.continue_on_stop,'continue_on_stop')),start=1):
             check=tk.Checkbutton(self.options_page,text=label,variable=variable,
                 command=lambda o=option,v=variable:self.preference(o,v.get()),bg='#101827',fg='#d8e1ef',
                 activebackground='#101827',selectcolor='#29364b',font=('Segoe UI',10),anchor='w',justify='left')
             check.grid(row=row,column=0,sticky='ew',pady=4);self.option_controls.append(check)
         tk.Label(self.options_page,text='Recent activity',bg='#101827',fg='#f4f6fc',
-            font=('Segoe UI',12,'bold')).grid(row=3,column=0,sticky='w',pady=(18,8))
-        activity_frame=tk.Frame(self.options_page,bg='#101827');activity_frame.grid(row=4,column=0,sticky='nsew')
+            font=('Segoe UI',12,'bold')).grid(row=4,column=0,sticky='w',pady=(18,8))
+        activity_frame=tk.Frame(self.options_page,bg='#101827');activity_frame.grid(row=5,column=0,sticky='nsew')
         activity_frame.columnconfigure(0,weight=1);activity_frame.rowconfigure(0,weight=1)
         self.activity=tk.Text(activity_frame,bg='#1b2637',fg='#d8e1ef',relief='flat',font=('Segoe UI',10),
             wrap='word',state='disabled',height=4,width=1,padx=10,pady=10)
@@ -224,7 +226,7 @@ class Panel:
 
     def preference(self, option, value):
         setting=config()
-        if option=='preserve_running':setting.setdefault('codex',{})[option]=value
+        if option in ('preserve_running','continue_on_stop'):setting.setdefault('codex',{})[option]=value
         else:setting[option]=value
         atomic_json(CONFIG,setting)
 
@@ -248,6 +250,7 @@ class Panel:
             except (TypeError,ValueError):threshold=2
             self.resets.set(setting.get('included_resets',False))
             self.preserve_running.set(setting.get('codex',{}).get('preserve_running',False))
+            self.continue_on_stop.set(setting.get('codex',{}).get('continue_on_stop',False))
             for app,tree in self.trees.items():
                 rows=status.get('selectable_sessions',{}).get(app,status.get('sessions',{}).get(app,[]))
                 rows=list(rows)

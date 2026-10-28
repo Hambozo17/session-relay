@@ -15,7 +15,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
-from recovery_policy import proxy_session, recovery_error
+from recovery_policy import proxy_session, recovery_error, recoverable_goal
 from relay_runtime import node_binary
 
 
@@ -26,7 +26,6 @@ _SETTINGS = (
     "serviceTier", "multiAgentMode",
 )
 _QUOTA_ERRORS = {"usageLimitExceeded", "quota", "login", "rate_limit_exceeded"}
-_ACTIVE_GOALS = {None, "active", "usage_limited"}
 _PACKAGE_LOCATION: pathlib.Path | None = None
 _PACKAGE_CHECKED_AT = 0.0
 
@@ -45,6 +44,10 @@ class DesktopNoOwnerError(DesktopAdapterError):
 
 class DesktopUncertainError(DesktopAdapterError):
     """A mutation may have reached Desktop; the operation must not be replayed."""
+
+
+class DesktopStoppedStateError(DesktopAdapterError):
+    """Stopped-chat validation failed before any continuation was delivered."""
 
 
 def quit_window(windows, foreground):
@@ -67,7 +70,7 @@ def pending_desktop_recovery(operation, rows, account):
         row=by_id.get(sid);before=operation.get('recovery_context',{}).get(sid)
         if (not row or not before or row.get('account_key') != account or not row.get('_owner')
                 or row.get('waiting') or row.get('is_child') or not row.get('supported') or row.get('_goal_deferred')
-                or row.get('_goal_mismatch') or row.get('_ephemeral') or row.get('goal_status') not in (None,'active')
+                or row.get('_goal_mismatch') or row.get('_ephemeral') or not recoverable_goal(row,False)
                 or row.get('_settings_fingerprint') != before.get('settings')):return None
         goal=dict(before['goal_record']) if before.get('goal_record') else None
         if goal and goal.get('status')=='usage_limited':goal['status']='active'
@@ -187,8 +190,12 @@ class _BridgeClient:
 
     def call(self, command: dict, timeout: float = 20.0):
         with self._lock:
-            self.start()
+            try:self.start()
+            except DesktopAdapterError as exc:
+                if command.get('op')=='continue_stopped':raise DesktopStoppedStateError('Desktop was unavailable before continuation') from exc
+                raise
             if self.process is None or self.process.stdin is None or self.process.poll() is not None:
+                if command.get('op')=='continue_stopped':raise DesktopStoppedStateError('Desktop disconnected before continuation')
                 raise DesktopAdapterError("Codex Desktop bridge disconnected")
             request_id = str(uuid.uuid4())
             payload = dict(command)
@@ -197,7 +204,7 @@ class _BridgeClient:
                 self.process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
                 self.process.stdin.flush()
             except (OSError, BrokenPipeError) as exc:
-                if command.get("op") in ("interrupt", "resume"):
+                if command.get("op") in ("interrupt", "resume", "continue_stopped"):
                     raise DesktopUncertainError("Codex Desktop mutation outcome is uncertain; do not retry") from exc
                 raise DesktopAdapterError("Codex Desktop bridge disconnected") from exc
             deadline = time.monotonic() + timeout
@@ -213,13 +220,17 @@ class _BridgeClient:
                 if response.get("kind") == "uncertain":
                     raise DesktopUncertainError("Codex Desktop mutation outcome is uncertain; do not retry")
                 if response.get("kind") == "incompatible":
+                    if command.get('op')=='continue_stopped':raise DesktopUncertainError('Protocol changed after continuation request')
                     raise DesktopProtocolError("Installed Codex Desktop protocol is incompatible")
                 if response.get("kind"):
+                    if command.get('op')=='continue_stopped':
+                        if response['kind'] in ('state_changed','no_owner'):raise DesktopStoppedStateError('Chat changed before continuation')
+                        raise DesktopUncertainError('Continuation result requires native confirmation')
                     if command.get("op") in ("interrupt", "resume") and response.get("kind") not in ("state_changed", "no_owner", "rejected", "incompatible"):
                         raise DesktopUncertainError("Codex Desktop mutation outcome is uncertain; do not retry")
                     raise DesktopAdapterError("Codex Desktop request could not be completed")
                 return response.get("result")
-            if command.get("op") in ("interrupt", "resume"):
+            if command.get("op") in ("interrupt", "resume", "continue_stopped"):
                 raise DesktopUncertainError("Codex Desktop mutation timed out; do not retry")
             raise DesktopAdapterError("Codex Desktop read request timed out")
 
@@ -616,6 +627,9 @@ class DesktopAdapter:
         self._inventory_complete = not unresolved
         self._last_diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
         current_key = self.accounts.current_desktop_key()
+        from accounts import LOCALDATA,load_json
+        try:setting=load_json(LOCALDATA/'config.json').get('codex',{})
+        except (OSError,ValueError):setting={}
         sessions = []
         for raw in rows:
             if not isinstance(raw, dict) or not _UUID.fullmatch(str(raw.get("id", ""))):
@@ -655,6 +669,7 @@ class DesktopAdapter:
                 "_goal_deferred": bool(goal and goal.get("deferred")),
                 "_goal_mismatch": mismatch,
                 "_ephemeral": bool(raw.get("ephemeral")),
+                "_continue_on_stop": bool(setting.get('enabled') and setting.get('continue_on_stop') and thread_id in setting.get('sessions',[])),
             }
             sessions.append(public)
         return sessions
@@ -821,7 +836,7 @@ class DesktopAdapter:
                 raise DesktopAdapterError("A selected Codex conversation is waiting for user input or approval")
             if session.get("is_child") or session.get("_ephemeral"):
                 raise DesktopAdapterError("A selected Codex conversation is not a recoverable top-level thread")
-            if session.get("goal_status") not in _ACTIVE_GOALS or session.get("_goal_deferred"):
+            if not recoverable_goal(session) or session.get("_goal_deferred"):
                 raise DesktopAdapterError("A selected Goal is paused, complete, limited, or deferred")
             if session.get("status") == "running":
                 if not session.get("turn_id") or not session.get("_owner") or not session.get("_settings_fingerprint"):
@@ -830,6 +845,8 @@ class DesktopAdapter:
                 if not session.get("turn_id") or not session.get("_owner"):
                     raise DesktopProtocolError("A selected failed conversation is missing recovery state")
             elif session.get('status')=='interrupted' and self.recovery_receipts.get(session['id']) == (session.get('turn_id'),session.get('_settings_fingerprint')):
+                pass
+            elif session.get('_continue_on_stop') and session.get('status')=='idle' and session.get('_owner') and session.get('turn_id'):
                 pass
             else:
                 raise DesktopAdapterError("A selected conversation was paused or stopped by the user")
@@ -859,7 +876,7 @@ class DesktopAdapter:
             return bool(session.get('status') in ('failed','idle') and isinstance(goal,dict)
                 and goal.get('status')=='usage_limited' and DesktopAdapter._goal_accounting_valid(goal))
         return bool(session.get('status')=='failed' and kind in quota_kinds|login_kinds
-            and session.get('goal_status') in (None,'active'))
+            and recoverable_goal(session,False))
 
     def _restore_usage_limited_goal(self, session_id, original_goal):
         """Restore only the exact usage-limited Goal snapshot read before shutdown."""
@@ -925,6 +942,19 @@ class DesktopAdapter:
             "clientUserMessageId": operation_id,
         }
 
+    def _check_continue_authorization(self,session,journal_callback,attempt):
+        if not session.get('_continue_on_stop'):return
+        from accounts import LOCALDATA,load_json
+        try:
+            setting=load_json(LOCALDATA/'config.json').get('codex',{})
+            allowed=setting.get('enabled') and setting.get('continue_on_stop') and session['id'] in setting.get('sessions',[])
+        except (OSError,ValueError):allowed=False
+        if not allowed:
+            self._safe_journal(journal_callback,'desktop-continuation-cancelled',{
+                'session':session['id'],'not_submitted':True})
+            self._attempted_sends.discard(attempt)
+            raise DesktopStoppedStateError('Stopped-chat continuation was disabled before submission')
+
     def resume_in_place(self, session_ids, journal_callback, recovery_operation=None):
         """Recover a known quota failure or a confirmed relay pause."""
         ids = list(session_ids)
@@ -948,7 +978,7 @@ class DesktopAdapter:
                 kind = ''.join(c for c in str(s.get('error_kind') or '').lower() if c.isalnum())
                 known_pause=(s['status']=='interrupted' and self.recovery_receipts.get(s['id'])==
                     (s['turn_id'],s['_settings_fingerprint']))
-                if recovery_operation is None and (not known_pause and (s['status'] != 'failed' or kind not in ('quota','usagelimitexceeded','ratelimitexceeded')) or s.get('goal_status') not in (None,'active')):
+                if recovery_operation is None and (not known_pause and (s['status'] != 'failed' or kind not in ('quota','usagelimitexceeded','ratelimitexceeded')) or not recoverable_goal(s,False)):
                     raise DesktopAdapterError('Only a known quota failure can continue without restarting Codex')
             if recovery_operation is None:
                 pauses={s['id']:{'turn':s['turn_id'],'settings':s['_settings_fingerprint'],
@@ -957,7 +987,7 @@ class DesktopAdapter:
                     self.recovery_receipts.get(s['id'])==(s['turn_id'],s['_settings_fingerprint'])}
                 self._safe_journal(journal_callback, 'desktop-recovery-context', {'context': {
                     s['id']: {'turn':s.get('turn_id'),'settings':s.get('_settings_fingerprint'),'settings_snapshot':s.get('_settings'),
-                        'goal_record':s.get('_goal_record')} for s in selected},'interruption_receipts':pauses,'account':account})
+                        'goal_record':s.get('_goal_record'),'continue_on_stop':s.get('_continue_on_stop',False)} for s in selected},'interruption_receipts':pauses,'account':account})
             recovered = []
             for s in selected:
                 if self.accounts.current_desktop_key() != account:
@@ -970,10 +1000,12 @@ class DesktopAdapter:
                 self._safe_journal(journal_callback, 'desktop-continuation-intent', {
                     'session':s['id'],'turn':s['turn_id'],'operation':operation,
                     'target':account,'settings':s['_settings_fingerprint'],'goal':s.get('goal_status')})
+                request=self._continuation_request(s,operation)
+                self._check_continue_authorization(s,journal_callback,attempt)
                 result = self._client().call({'op':'resume','thread':s['id'],'operation_id':operation,
                     'expected_owner':s['_owner'],'expected_turn':s['turn_id'],
                     'settings_fingerprint':s['_settings_fingerprint'],
-                    'request':self._continuation_request(s,operation)}, timeout=40)
+                    'request':request,'allow_stopped':s.get('_continue_on_stop',False)}, timeout=40)
                 row = result.get('session') if isinstance(result,dict) else None
                 if (not isinstance(row,dict) or row.get('status') not in ('running','idle') or
                     not row.get('turn_id') or row['turn_id']==s['turn_id'] or
@@ -984,6 +1016,39 @@ class DesktopAdapter:
                     'session':s['id'],'target':account,'turn':row['turn_id']})
                 recovered.append(s['id'])
             return recovered
+
+    def continue_stopped(self, expected, message_id):
+        """Send one opted-in continuation, inheriting settings and leaving Goal data alone."""
+        from accounts import LOCALDATA,load_json
+        from auto_continue import stopped_chat
+        sid=expected['id']
+        with self._lock:
+            try:
+                setting=load_json(LOCALDATA/'config.json').get('codex',{})
+                if not setting.get('enabled') or not setting.get('continue_on_stop') or sid not in setting.get('sessions',[]):
+                    raise DesktopStoppedStateError('Stopped-chat continuation is no longer enabled')
+                catalog=self._catalog();rows=self._scan({sid:catalog[sid]},wait_ms=5000)
+                current=next((row for row in rows if row['id']==sid),None)
+                if (not current or not current.get('_continue_on_stop') or not stopped_chat(current) or recovery_error(current.get('error_kind'))
+                        or current['turn_id']!=expected.get('turn_id') or current['_settings_fingerprint']!=expected.get('_settings_fingerprint')
+                        or self.accounts.current_desktop_key()!=expected.get('account_key')):
+                    raise DesktopStoppedStateError('The stopped chat changed before continuation')
+            except DesktopUncertainError:raise
+            except Exception as exc:raise DesktopStoppedStateError('Stopped-chat preflight did not authorize a send') from exc
+            request=self._continuation_request(current,message_id)
+            request['input'][0]['text']='Automatic Relay check: continue unfinished work that is already authorized in this same chat. A Goal is not required. Preserve the current model, reasoning effort, permissions, task context and any existing Goal. This automatic message does not grant new permissions or human approval. Keep waiting if human input or approval is required.'
+            try:
+                setting=load_json(LOCALDATA/'config.json').get('codex',{})
+                if (not setting.get('enabled') or not setting.get('continue_on_stop') or sid not in setting.get('sessions',[])
+                        or self.accounts.current_desktop_key()!=expected.get('account_key')):
+                    raise DesktopStoppedStateError('Stopped-chat continuation is no longer enabled')
+            except Exception as exc:raise DesktopStoppedStateError('Final stopped-chat permission check did not authorize a send') from exc
+            result=self._client().call({'op':'continue_stopped','thread':sid,'operation_id':message_id,
+                'expected_owner':current['_owner'],'expected_turn':current['turn_id'],
+                'settings_fingerprint':current['_settings_fingerprint'],'request':request},timeout=50)
+            row=result.get('session') if isinstance(result,dict) else None
+            if not isinstance(row,dict):raise DesktopUncertainError('Continuation was not confirmed')
+            return row
 
     def rotate(self, session_ids, target, journal_callback, *, same_account_recovery=False,
             same_account_recovery_ids=None):
@@ -1023,7 +1088,7 @@ class DesktopAdapter:
             originals = {session["id"]: dict(session) for session in selected}
             self._safe_journal(journal_callback,'desktop-recovery-context',{'context':{
                 sid:{'turn':o.get('turn_id'),'settings':o.get('_settings_fingerprint'),
-                     'settings_snapshot':o.get('_settings'),'goal_record':o.get('_goal_record')}
+                     'settings_snapshot':o.get('_settings'),'goal_record':o.get('_goal_record'),'continue_on_stop':o.get('_continue_on_stop',False)}
                 for sid,o in originals.items()}})
             operations = {sid: str(uuid.uuid4()) for sid in ids}
             for session in selected:
@@ -1080,7 +1145,7 @@ class DesktopAdapter:
                     'goal': o.get('goal_status'), 'relay_interrupted': o.get('status') == 'running' or sid in self.recovery_receipts}
                     for sid, o in originals.items()},
                 "context": {sid: {'turn': o.get('turn_id'), 'settings': o.get('_settings_fingerprint'),
-                    'settings_snapshot': o.get('_settings'), 'goal_record': o.get('_goal_record')}
+                    'settings_snapshot': o.get('_settings'), 'goal_record': o.get('_goal_record'),'continue_on_stop':o.get('_continue_on_stop',False)}
                     for sid, o in originals.items()},
             })
             self._app_control.close_app()
@@ -1172,11 +1237,11 @@ class DesktopAdapter:
                     continue
                 if original.get("goal_status") == "active" and row.get("goal_status") != "active":
                     raise DesktopAdapterError("Codex Desktop has not restored the existing active Goal state")
-                if row.get("waiting") or row.get("is_child") or row.get("_ephemeral") or row.get("goal_status") not in _ACTIVE_GOALS:
+                if row.get("waiting") or row.get("is_child") or row.get("_ephemeral") or not recoverable_goal(row):
                     raise DesktopAdapterError("The original conversation is no longer safe to continue")
                 if row.get("status") == "running" and row.get("_runtime_status") == "active":
                     continue
-                if row.get("status") not in {"interrupted", "failed"} and not (row.get('status')=='idle' and original.get('goal_status')=='active'):
+                if row.get("status") not in {"interrupted", "failed"} and not (row.get('status')=='idle' and (original.get('goal_status')=='active' or original.get('_continue_on_stop'))):
                     raise DesktopAdapterError("The original selected turn changed during recovery")
             recovered = []
             for sid in ids:
@@ -1196,9 +1261,9 @@ class DesktopAdapter:
                     })
                     recovered.append(sid)
                     continue
-                if latest.get("status") == "failed" and not recovery_error(latest.get("error_kind")) and original.get('goal_status')!='active':
+                if latest.get("status") == "failed" and not recovery_error(latest.get("error_kind")) and original.get('goal_status')!='active' and not original.get('_continue_on_stop'):
                     raise DesktopAdapterError("The original turn stopped for a reason that cannot be resumed automatically")
-                if latest.get("status") not in {"interrupted", "failed"} and not (latest.get('status')=='idle' and original.get('goal_status')=='active'):
+                if latest.get("status") not in {"interrupted", "failed"} and not (latest.get('status')=='idle' and (original.get('goal_status')=='active' or original.get('_continue_on_stop'))):
                     raise DesktopAdapterError("The original selected turn is no longer eligible for continuation")
                 op = operations[sid]
                 attempt = (sid, original.get("turn_id") or "", target["key"])
@@ -1210,13 +1275,16 @@ class DesktopAdapter:
                     "target": target["key"], "settings": original.get("_settings_fingerprint"),
                     "goal": original.get("goal_status"),
                 })
+                request=self._continuation_request(original,op)
+                self._check_continue_authorization(original,journal_callback,attempt)
                 try:
                     result = self._bridge.call({
                         "op": "resume", "thread": sid, "operation_id": op,
                         "expected_owner": latest.get("_owner"),
                         "expected_turn": original.get("turn_id"),
                         "settings_fingerprint": original.get("_settings_fingerprint"),
-                        "request": self._continuation_request(original, op),
+                        "request": request,
+                        "allow_stopped": original.get('_continue_on_stop',False),
                     }, timeout=40)
                 except DesktopUncertainError:
                     raise
@@ -1227,6 +1295,12 @@ class DesktopAdapter:
                     raise DesktopUncertainError("Codex Desktop continuation outcome is uncertain; do not retry")
                 if result["session"].get("settings_fingerprint") != original.get("_settings_fingerprint"):
                     raise DesktopAdapterError("Codex Desktop changed original conversation settings")
+                row=result['session']
+                if row.get('status')=='failed' and recovery_error(row.get('error_kind')):
+                    raise DesktopAdapterError('Codex continuation reached a usage/login failure; rechecking native recovery')
+                if (row.get('status') not in ('running','idle') or not row.get('turn_id')
+                        or row['turn_id']==original.get('turn_id') or row.get('client_user_message_id')!=op):
+                    raise DesktopUncertainError('Codex Desktop continuation was not confirmed; do not retry')
                 self._safe_journal(journal_callback, "desktop-session-recovered", {
                     "session": sid, "target": target["key"], "turn": result["session"].get("turn_id"),
                 })

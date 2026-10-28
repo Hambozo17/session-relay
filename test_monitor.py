@@ -29,6 +29,46 @@ class Adapter:
     def discover(self): return self.rows
 
 class Monitor(unittest.TestCase):
+    def test_proven_unsent_cancelled_continue_does_not_leave_a_recovery_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder);(root/'operations').mkdir();path=root/'operations/cancelled.json'
+            path.write_text(json.dumps({'id':'cancelled','app':'codex','state':'needs-attention',
+                'phase':'desktop-continuation-cancelled','sessions':['chat'],'metadata':{'session':'chat','not_submitted':True}}))
+            cfg={'orca':{'enabled':False},'codex':{'enabled':False}}
+            with patch.object(controller,'LOCALDATA',root),patch.object(controller,'STATUS',root/'status.json'),patch.object(controller,'JOURNAL',root/'journal.json'),patch.object(controller,'config',return_value=cfg),patch.object(controller.Controller,'refresh_accounts',return_value=None):
+                c=controller.Controller(Accounts(),{'orca':Adapter([]),'codex':Adapter([])})
+                try:
+                    c.cycle();self.assertFalse(c.unresolved);self.assertNotIn('codex',c.attention)
+                    self.assertEqual(json.loads(path.read_text())['state'],'reconciled-before-continuation')
+                finally:c.refresh_pool.shutdown(wait=True)
+
+    def test_old_orca_interrupt_retires_after_new_work_without_replaying_or_changing_settings(self):
+        original={'id':'chat','turn_id':'old','_context_turn_id':'old','status':'running','model':'chosen','effort':'xhigh',
+            'approval_policy':'never','sandbox_policy':{'type':'danger-full-access'},'permission_profile':{'type':'disabled'},
+            'terminal':'pane','incarnation':'inc','pty_id':'pty','home':'saved','cwd':'workspace','account_key':'active','_goal':None}
+        operation={'id':'old-interrupt','app':'orca','state':'needs-attention','phase':'interrupt','sessions':['chat'],
+            'outgoing':'active','target':'other','orca_recovery_context':{'chat':original}}
+        row=dict(original,turn_id='new',_context_turn_id='new',connected=True,supported=True)
+        self.assertTrue(controller.orca_interrupt_superseded(operation,[row]))
+        for change in ({'turn_id':'old'},{'_context_turn_id':'old'},{'status':'interrupted'},
+                {'waiting':True},{'status':'failed','error_kind':'network'},{'account_key':'other'},
+                {'incarnation':'other'},{'terminal':'other'},{'pty_id':'other'},{'home':'other'},
+                {'effort':'low'},{'approval_policy':'on-request'},{'goal_status':'paused'},
+                {'_goal':{'goal_id':'new'}},{'model_provider':'other-provider'}):
+            self.assertFalse(controller.orca_interrupt_superseded(operation,[dict(row,**change)]),change)
+        self.assertFalse(controller.orca_interrupt_superseded(dict(operation,phase='send-continuation'),[row]))
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder);(root/'operations').mkdir();path=root/'operations/old-interrupt.json'
+            path.write_text(json.dumps(operation));accounts=Accounts()
+            cfg={'orca':{'enabled':True,'sessions':['chat']},'codex':{'enabled':False}}
+            with patch.object(controller,'LOCALDATA',root),patch.object(controller,'STATUS',root/'status.json'),patch.object(controller,'JOURNAL',root/'journal.json'),patch.object(controller,'config',return_value=cfg),patch.object(controller.Controller,'refresh_accounts',return_value=None):
+                c=controller.Controller(accounts,{'orca':Adapter([row]),'codex':Adapter([])})
+                try:
+                    c.cycle();self.assertFalse(c.unresolved);self.assertNotIn('orca',c.attention)
+                    self.assertEqual(json.loads(path.read_text())['state'],'reconciled-before-continuation')
+                    self.assertEqual(row['turn_id'],'new')
+                finally:c.refresh_pool.shutdown(wait=True)
+
     def test_missing_selected_owner_reopens_once_per_minute_across_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             root=pathlib.Path(folder);now=[1000.0];accounts=Accounts();accounts.current_desktop_key=lambda:'active'

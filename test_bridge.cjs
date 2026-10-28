@@ -5,6 +5,32 @@ const {Bridge, summarize, applyPatches} = require('./desktop_bridge.cjs');
 const id = '123e4567-e89b-42d3-a456-426614174000';
 const operation = '987e6543-e21b-42d3-a456-426614174000';
 
+test('opted-in stopped continuation works without Goal and never grants approval', async () => {
+  for (const goal of [null,'blocked','completed']) {
+    const bridge=new Bridge(()=>{});let sends=0;
+    bridge.fresh=async()=>({owner:'owner',summary:{turn_id:'old',status:'idle',runtime_status:'idle',goal_status:goal,settings_fingerprint:'same'}});
+    bridge.request=async(_,params)=>{sends++;assert.equal(params.turnStart.context.inheritThreadSettings,true);assert.equal(params.turnStart.context.usePermissionSelection,false)};
+    bridge.waitFor=async(_,predicate)=>{
+      const row={turn_id:'new',status:'running',goal_status:goal,settings_fingerprint:'same',client_user_message_id:operation};assert.equal(predicate(row),true);return row;
+    };
+    const request={threadId:id,clientUserMessageId:operation,input:[{type:'text',text:'continue'}]};
+    await bridge.resume({op:'continue_stopped',thread:id,operation_id:operation,expected_turn:'old',settings_fingerprint:'same',request});
+    await assert.rejects(bridge.resume({op:'continue_stopped',thread:id,operation_id:operation,expected_turn:'old',settings_fingerprint:'same',request}),{kind:'uncertain'});
+    assert.equal(sends,1);
+  }
+});
+
+test('stopped continuation preserves running turns, manual stops, approvals and quota routing', async () => {
+  for (const change of [{status:'running',runtime_status:'active'},{status:'interrupted'},{waiting:true},
+      {goal_status:'paused'},{status:'failed',error_kind:'usageLimitExceeded'}]) {
+    const bridge=new Bridge(()=>{});let sends=0;
+    bridge.fresh=async()=>({owner:'owner',summary:{turn_id:'old',status:'idle',runtime_status:'idle',goal_status:null,settings_fingerprint:'same',...change}});
+    bridge.request=async()=>{sends++};
+    await assert.rejects(bridge.resume({op:'continue_stopped',thread:id,operation_id:operation,expected_turn:'old',settings_fingerprint:'same',request:{threadId:id,clientUserMessageId:operation,input:[{type:'text',text:'continue'}]}}),{kind:'state_changed'});
+    assert.equal(sends,0);
+  }
+});
+
 test('owner discovery retries transient reads and preserves unresolved ownership', async () => {
   for (const succeeds of [true,false]) {
     const bridge=new Bridge(()=>{});bridge.compatible=true;

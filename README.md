@@ -23,7 +23,9 @@ Fresh installations start with both automation controls disabled. Closing the pa
 - Remember verified quota failures across relay restarts. Record allowance windows to avoid repeated continuations against stale quota readings. An uncertain submission stays blocked for review.
 - Recheck failed saved sign-ins every minute. A failed login is not usable until a fresh check succeeds. The relay does not perform a new browser sign-in.
 
-Manual stops, approval requests, paused/completed Goals, independent Goal budget limits, and unrelated conversations remain stopped. Proxy-provider limits do not trigger an OpenAI account switch. Automatic wait-and-retry for proxy quotas is not implemented.
+By default, manual stops, approval requests, paused/completed Goals, independent Goal budget limits, and unrelated conversations remain stopped. Proxy-provider limits do not trigger an OpenAI account switch. Automatic wait-and-retry for proxy quotas is not implemented.
+
+In Automation preferences, **Send Continue when selected Codex chats stop** enables continued work without requiring a Goal. It can continue idle or blocked work, with three minutes between retries. Running turns, manual stops, paused Goals, budget limits and approval requests remain protected. Automatic continuation messages do not grant human approval. Disable this option or Codex monitoring to stop the loop.
 
 Orca recovery uses its local authenticated runtime and original terminal pane. Codex Desktop recovery may need a normal application restart; it checks other running conversations and approvals first. Both integrations depend on the installed applications' local protocols. An incompatible or unverifiable protocol stops recovery with a status message.
 

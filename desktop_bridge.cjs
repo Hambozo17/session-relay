@@ -716,12 +716,18 @@ class Bridge {
     }
     const current = await this.fresh(id, command.expected_owner);
     const state = current.summary;
+    const stopped = command.op === 'continue_stopped' || command.allow_stopped === true;
+    if (command.op === 'continue_stopped' && recoveryError(state.error_kind)) {
+      throw error('quota or login recovery requires allowance selection', 'state_changed');
+    }
     const allowed = state.status === 'interrupted' ||
       (state.status === 'failed' && (recoveryError(state.error_kind) || state.goal_status === 'active')) ||
-      (state.status === 'idle' && state.goal_status === 'active');
+      (state.status === 'idle' && state.goal_status === 'active') || stopped && ['idle','failed'].includes(state.status);
+    const goals=stopped?[null,'active','blocked','complete','completed']:[null,'active'];
     if (state.turn_id !== command.expected_turn || !allowed ||
-        !['idle', 'notLoaded'].includes(state.runtime_status) || state.waiting ||
-        state.is_child || state.ephemeral || ![null, 'active'].includes(state.goal_status) ||
+        !(stopped && state.status==='failed'?['idle','notLoaded','systemError']:['idle','notLoaded']).includes(state.runtime_status) || state.waiting ||
+        command.op==='continue_stopped' && state.status==='interrupted' ||
+        state.is_child || state.ephemeral || !goals.includes(state.goal_status) ||
         state.settings_fingerprint !== command.settings_fingerprint) {
       throw error('conversation changed or is ineligible for automatic continuation', 'state_changed');
     }
@@ -741,9 +747,9 @@ class Bridge {
     }, current.owner, 30000, true);
     const confirmed = await this.waitFor(id, (item) =>
       item.turn_id && item.turn_id !== command.expected_turn &&
-      item.client_user_message_id === operation && ['running', 'idle'].includes(item.status) &&
+      item.client_user_message_id === operation && (stopped?['running','idle','failed']:['running','idle']).includes(item.status) &&
       item.settings_fingerprint === command.settings_fingerprint &&
-      [null, 'active', 'completed'].includes(item.goal_status),
+      (stopped?[null,'active','blocked','complete','completed','usage_limited']:[null,'active','completed']).includes(item.goal_status),
     15000, 'continuation result could not be confirmed; do not retry');
     return { session: confirmed, owner: current.owner };
   }
@@ -756,7 +762,7 @@ class Bridge {
       return { session: result.summary, owner: result.owner };
     }
     if (command.op === 'interrupt') return this.interrupt(command);
-    if (command.op === 'resume') return this.resume(command);
+    if (command.op === 'resume' || command.op === 'continue_stopped') return this.resume(command);
     if (command.op === 'close') {
       this.closing = true;
       if (this.socket && !this.socket.destroyed) this.socket.end();

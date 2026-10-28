@@ -14,6 +14,7 @@ from relay_runtime import bundled_node, installer_script, is_frozen, node_binary
 
 
 _APPLICATION_MODULES = (
+    "auto_continue",
     "accounts",
     "app",
     "controller",

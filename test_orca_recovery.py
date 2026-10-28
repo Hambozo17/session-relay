@@ -329,6 +329,12 @@ class OrcaRecovery(unittest.TestCase):
                 rpc.incarnation='inc';a.bindings['chat']['status_verified']=False;self.assertEqual(a.discover(),[])
 
     def test_bound_transcript_refreshes_permission_profile_and_context_turn_id(self):
+        self._bound_transcript_refresh()
+
+    def test_bound_transcript_does_not_erase_a_fresh_limit_banner(self):
+        self._bound_transcript_refresh(quota=True)
+
+    def _bound_transcript_refresh(self,quota=False):
         with tempfile.TemporaryDirectory() as folder:
             root=pathlib.Path(folder);source_home=root/'source';target_home=root/'target'
             path=source_home/'sessions/chat.jsonl';path.parent.mkdir(parents=True)
@@ -354,7 +360,7 @@ class OrcaRecovery(unittest.TestCase):
                                 'id':'chat','transcriptPath':str(path)}}}]}]}
                     if method=='terminal.list':return {'terminals':[{'handle':'pane','incarnationId':'inc',
                         'connected':True,'ptyId':'pty','worktreeId':'work','tabId':'tab'}]}
-                    if method=='terminal.read':return {'terminal':{'source':'screen','tail':['Ask Codex']}}
+                    if method=='terminal.read':return {'terminal':{'source':'screen','tail':["You've hit your usage limit"] if quota else ['Ask Codex']}}
                     raise AssertionError(method)
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(module,'LOCALDATA',root))
@@ -369,6 +375,59 @@ class OrcaRecovery(unittest.TestCase):
             self.assertEqual(row['permission_profile'],fresh['permission_profile'])
             self.assertEqual(row['active_permission_profile'],fresh['active_permission_profile'])
             self.assertEqual(row['_context_turn_id'],'fresh-turn')
+            if quota:
+                self.assertEqual(row['status'],'failed');self.assertEqual(row['error_kind'],'quota')
+                self.assertTrue(row['_screen_quota'])
+
+    def test_idle_tui_requires_fresh_empty_prompt_without_running_indicator(self):
+        idle={'source':'screen','tail':['\u203a Ask Codex to do anything']}
+        self.assertTrue(module.idle_tui(idle))
+        for changed in ({'source':'stream'},{'draft':'unsent input'},
+                {'tail':['\u2022 Working (20s \u2022 esc to interrupt)','\u203a Ask Codex to do anything']},
+                {'tail':['\u203a user draft']}):
+            self.assertFalse(module.idle_tui(dict(idle,**changed)))
+        info={'status':'interrupted','turn_id':'manual','error_kind':'user_interrupt'}
+        module.screen_quota(info,{'source':'screen','tail':["You've hit your usage limit"]})
+        self.assertEqual(info['status'],'interrupted');self.assertNotIn('_screen_quota',info)
+
+    def test_exact_stopped_turn_and_idle_tui_override_a_stale_working_hook(self):
+        self._stale_working_hook()
+
+    def test_new_turn_after_idle_screen_or_before_quit_is_never_quit(self):
+        for race_at in (2,3):
+            with self.subTest(race_at=race_at):self._stale_working_hook(race_at)
+
+    def _stale_working_hook(self,race_at=None):
+        class AtQuit(Exception):pass
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder);f=NativeFixture(root);f.original.update(status='running',error_kind=None)
+            stopped=[False];calls=[];original_call=f.call
+            def call(method,params=None,**kwargs):
+                calls.append((method,params))
+                if method=='terminal.agentStatus':return {'agentStatus':{'status':'working'}}
+                if method=='terminal.read':return {'terminal':{'source':'screen','tail':['\u203a Ask Codex to do anything']}}
+                if method=='terminal.send' and params.get('interrupt'):stopped[0]=True
+                return original_call(method,params,**kwargs)
+            reads=[0]
+            def transcript(path):
+                if stopped[0]:reads[0]+=1
+                if race_at is not None and reads[0]>=race_at:
+                    return dict(f.original,status='running',turn_id='newer-turn',event_pos=30)
+                return dict(f.original,status='interrupted' if stopped[0] else 'running',event_pos=20 if stopped[0] else 10)
+            phases=[]
+            def journal(phase,data):
+                phases.append(phase)
+                if phase=='quit-codex':raise AtQuit()
+            with contextlib.ExitStack() as stack:
+                for name,value in [('LOCALDATA',root),('identity',lambda *_:{'key':'new'}),
+                        ('protected_json',lambda *_:{}),('inherit_project_trust',lambda *_:None),
+                        ('read_transcript',transcript)]:stack.enter_context(patch.object(module,name,value))
+                stack.enter_context(patch.object(module.time,'sleep',lambda *_:None))
+                f.call=call;a=module.OrcaAdapter(object(),f);a.get=f.get
+                with self.assertRaises(RuntimeError if race_at else AtQuit):a.rotate(['chat'],f.target,journal)
+            if race_at:self.assertNotIn('quit-codex',phases)
+            else:self.assertIn('quit-codex',phases)
+            self.assertEqual(sum(method=='terminal.send' and bool(params.get('interrupt')) for method,params in calls),1)
 
     def test_exited_quota_pane_stays_discoverable_but_manual_stop_does_not(self):
         with tempfile.TemporaryDirectory() as folder:

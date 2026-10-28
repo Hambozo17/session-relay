@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.23
+
+- Add an optional Continue mode for stopped selected Codex chats, including chats without a Goal and blocked work that can continue without human input.
+- Persist each continuation before sending, confirm its native message identity, and wait three minutes between retries.
+- Recheck the live selection and Continue switch before submission, and share the cooldown with confirmed quota recoveries across restarts.
+- Retire old Orca interrupt failures after verifying newer work in the same pane; retain limit banners after resolving managed account bindings.
+- Recognize an exact stopped Orca turn with a fresh idle terminal even if its agent hook still reports working.
+- Preserve running turns, manual stops, approval requests and all model/permission settings; automatic messages cannot grant human approval.
+
 ## 1.0.22
 
 - Resolve a removed Codex Store installation again after an update instead of retaining its obsolete path.

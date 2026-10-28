@@ -270,6 +270,97 @@ class DesktopAdapterTests(unittest.TestCase):
         self.assertEqual(len([c for c in bridge.calls if c['op']=='resume']),1)
         self.assertEqual(app.closed,0);self.assertEqual(accounts.activations,0)
 
+    def test_stopped_continuation_rechecks_selection_and_leaves_goal_database_alone(self):
+        class ContinueBridge(FakeBridge):
+            def call(self,command,timeout=20):
+                if command['op']!='continue_stopped':return super().call(command,timeout)
+                self.calls.append(dict(command));row=self.rows[0]
+                row.update(status='running',runtime_status='active',turn_id='continued',client_user_message_id=command['operation_id'])
+                return {'session':dict(row)}
+        bridge=ContinueBridge([make_row(status='idle',runtime_status='idle')]);adapter,accounts,app=self._adapter(bridge)
+        cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD]}}
+        with patch('accounts.load_json',return_value=cfg):
+            expected=adapter._scan(adapter._catalog())[0]
+            result=adapter.continue_stopped(expected,OTHER_THREAD)
+            self.assertEqual(result['turn_id'],'continued')
+            request=next(call for call in bridge.calls if call['op']=='continue_stopped')
+            self.assertIn('does not grant new permissions or human approval',request['request']['input'][0]['text'])
+            self.assertEqual(adapter._read_goals(),{})
+            self.assertEqual(app.closed,0);self.assertEqual(accounts.activations,0)
+            cfg['codex']['continue_on_stop']=False
+            with self.assertRaises(desktop_adapter.DesktopStoppedStateError):adapter.continue_stopped(expected,OTHER_THREAD)
+            self.assertEqual(len([c for c in bridge.calls if c['op']=='continue_stopped']),1)
+
+    def test_stopped_continuation_respects_switches_changed_during_preflight(self):
+        for stage in ('scan','request'):
+            for change in ({'enabled':False},{'continue_on_stop':False},{'sessions':[]}):
+                with self.subTest(stage=stage,change=change):
+                    bridge=FakeBridge([make_row(status='idle',runtime_status='idle')])
+                    adapter,accounts,app=self._adapter(bridge)
+                    cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD]}}
+                    with patch('accounts.load_json',return_value=cfg):
+                        expected=adapter._scan(adapter._catalog())[0]
+                        original=adapter._scan if stage=='scan' else adapter._continuation_request
+                        def changed(*args,**kwargs):
+                            cfg['codex'].update(change)
+                            return original(*args,**kwargs)
+                        attribute='_scan' if stage=='scan' else '_continuation_request'
+                        with patch.object(adapter,attribute,side_effect=changed):
+                            with self.assertRaises(desktop_adapter.DesktopStoppedStateError):
+                                adapter.continue_stopped(expected,OTHER_THREAD)
+                    self.assertFalse(any(c['op']=='continue_stopped' for c in bridge.calls))
+                    self.assertEqual(app.closed,0);self.assertEqual(accounts.activations,0)
+
+    def test_opted_in_idle_chat_can_switch_accounts_without_a_goal_or_with_blocked_goal(self):
+        for goal in (None,'blocked'):
+            with self.subTest(goal=goal):
+                self._write_goal(goal)
+                before=FakeBridge([make_row(status='idle',runtime_status='idle',goal_status=goal)])
+                after=FakeBridge([make_row(status='idle',runtime_status='idle',goal_status=goal)])
+                adapter,accounts,app=self._adapter(before,bridges=[after])
+                cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD]}}
+                with patch('accounts.load_json',return_value=cfg):
+                    self.assertEqual(adapter.rotate([THREAD],accounts.find(NEW_KEY),lambda *_:None),[THREAD])
+                    request=next(call for call in after.calls if call['op']=='resume')
+                    self.assertTrue(request['allow_stopped'])
+                    self.assertEqual((adapter._read_goals().get(THREAD) or {}).get('status'),goal)
+
+    def test_restart_continuation_respects_live_revocation_after_launch_and_intent(self):
+        for stage in ('launch','intent'):
+            for change in ({'enabled':False},{'continue_on_stop':False},{'sessions':[]}):
+                with self.subTest(stage=stage,change=change):
+                    before=FakeBridge([make_row(status='idle',runtime_status='idle')])
+                    after=FakeBridge([make_row(status='idle',runtime_status='idle')])
+                    adapter,accounts,app=self._adapter(before,bridges=[after]);phases=[]
+                    cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD]}}
+                    if stage=='launch':app.on_launch=lambda:cfg['codex'].update(change)
+                    def journal(phase,metadata):
+                        phases.append(phase)
+                        if stage=='intent' and phase=='desktop-continuation-intent':cfg['codex'].update(change)
+                    with patch('accounts.load_json',return_value=cfg):
+                        with self.assertRaises(desktop_adapter.DesktopStoppedStateError):
+                            adapter.rotate([THREAD],accounts.find(NEW_KEY),journal)
+                    self.assertFalse(any(c['op']=='resume' for c in after.calls))
+                    self.assertIn('desktop-continuation-cancelled',phases)
+                    self.assertFalse(adapter._attempted_sends)
+
+    def test_quota_failed_stopped_continuation_is_not_recorded_as_recovery(self):
+        class FailedBridge(FakeBridge):
+            def call(self,command,timeout=20):
+                result=super().call(command,timeout)
+                if command['op']=='resume':
+                    result['session'].update(status='failed',error_kind='usageLimitExceeded',runtime_status='idle')
+                return result
+        before=FakeBridge([make_row(status='idle',runtime_status='idle')])
+        after=FailedBridge([make_row(status='idle',runtime_status='idle')])
+        adapter,accounts,app=self._adapter(before,bridges=[after]);phases=[]
+        cfg={'codex':{'enabled':True,'continue_on_stop':True,'sessions':[THREAD]}}
+        with patch('accounts.load_json',return_value=cfg):
+            with self.assertRaisesRegex(DesktopAdapterError,'usage/login failure'):
+                adapter.rotate([THREAD],accounts.find(NEW_KEY),lambda phase,data:phases.append(phase))
+        self.assertEqual(phases[-1],'desktop-continuation-intent')
+        self.assertNotIn('desktop-session-recovered',phases)
+
     def test_failed_first_send_keeps_order_and_durable_unsent_pause_receipts(self):
         import controller,time
         self._insert_thread(OTHER_THREAD)

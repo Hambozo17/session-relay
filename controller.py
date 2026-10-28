@@ -3,13 +3,14 @@ import ctypes, hashlib, json, math, os, pathlib, threading, time, traceback, uui
 from concurrent.futures import ThreadPoolExecutor
 from accounts import AccountManager, LOCALDATA, REAL_HOME, ACCOUNT_REFRESH_SECONDS, atomic_json, load_json, normalize_threshold
 from orca_adapter import OrcaAdapter
-from recovery_policy import recovery_error, proxy_session
+from recovery_policy import recovery_error, proxy_session, recoverable_goal
 from transcript import permission_policy_equal
+from auto_continue import AutoContinue, stopped_chat
 
 CONFIG = LOCALDATA / 'config.json'
 STATUS = LOCALDATA / 'status.json'
 JOURNAL = LOCALDATA / 'journal.json'
-VERSION = '1.0.22'
+VERSION = '1.0.23'
 
 def config():
     try: return load_json(CONFIG)
@@ -27,7 +28,7 @@ def weekly_fallback(quota):
 def can_return_from_weekly(session, quota):
     return bool(weekly_fallback(quota) and session.get('status') == 'running' and
         not proxy_session(session) and not session.get('waiting') and not session.get('is_child') and
-        session.get('goal_status') in (None, 'active'))
+        recoverable_goal(session,False))
 
 def destination_needs_check(quota, threshold):
     if str(quota.get('plan', '')).lower() == 'free': return False
@@ -56,7 +57,7 @@ def same_account_retry_allowed(app, sessions, quota, attempts):
     if not sessions or any(not (s.get('status')=='failed' and recovery_error(s.get('error_kind'))
             or s.get('status') in ('failed','idle') and s.get('goal_status')=='usage_limited')
             or s.get('waiting') or s.get('is_child') or proxy_session(s)
-            or s.get('goal_status') not in (None,'active','usage_limited') for s in sessions):return False
+            or not recoverable_goal(s) for s in sessions):return False
     ids={s['id'] for s in sessions};key=sessions[0].get('account_key')
     for op in attempts:
         if op.get('app')!=app or op.get('target')!=key or not ids.intersection(op.get('sessions',[])):continue
@@ -78,7 +79,7 @@ def in_place_recovery_eligible(sessions):
     return bool(sessions) and all(
         s.get('status')=='failed'
         and ''.join(c for c in str(s.get('error_kind') or '').lower() if c.isalnum()) in quota_kinds
-        and s.get('goal_status') in (None,'active')
+        and recoverable_goal(s,False)
         and not s.get('waiting') and not s.get('is_child') and not proxy_session(s)
         and not s.get('_goal_deferred') and not s.get('_goal_mismatch') and not s.get('_ephemeral')
         for s in sessions)
@@ -99,7 +100,7 @@ def same_account_restart_eligible(sessions):
             needs_restart=True
             continue
         if (session.get('status')=='failed' and kind in quota_kinds|login_kinds
-                and goal in (None,'active')):
+                and recoverable_goal(session,False)):
             needs_restart=True
             continue
         return False
@@ -151,6 +152,28 @@ def orca_continuation_failed(operation, sessions):
         all(isinstance(new_goal.get(k),(int,float)) and new_goal[k]>=old_goal.get(k,0)
             for k in ('tokens_used','time_used_seconds')))
 
+def orca_interrupt_superseded(operation, sessions):
+    """Retire a pre-quit interrupt intent only after every original pane moved on."""
+    if operation.get('app')!='orca' or operation.get('phase')!='interrupt' or not operation.get('sessions'):return False
+    rows={row['id']:row for row in sessions}
+    for sid in operation['sessions']:
+        row=rows.get(sid);before=operation.get('orca_recovery_context',{}).get(sid)
+        if (not row or not before or not orca_resumed_context_verified(operation,row)
+                or row.get('status') not in ('running','idle','failed')
+                or row.get('status')=='failed' and not recovery_error(row.get('error_kind'))
+                or row.get('waiting') or row.get('is_child') or proxy_session(row)
+                or row.get('connected') is not True or row.get('supported') is not True
+                or row.get('account_key')!=operation.get('outgoing')
+                or any(not before.get(k) or row.get(k)!=before[k] for k in ('terminal','incarnation','pty_id','home','cwd'))
+                or row.get('model_provider')!=before.get('model_provider')
+                or row.get('goal_status') not in (None,'active','usage_limited')):return False
+        old=before.get('_goal');new=row.get('_goal')
+        if old is None or new is None:
+            if old is not None or new is not None:return False
+        elif (any(old.get(k)!=new.get(k) for k in ('goal_id','token_budget')) or
+                any(not isinstance(new.get(k),(int,float)) or new[k]<old.get(k,0) for k in ('tokens_used','time_used_seconds'))):return False
+    return True
+
 def allowance_wait_message(quotas):
     now=time.time()
     resets=[q[k] for q in quotas for k in ('reset_at','weekly_reset_at')
@@ -175,7 +198,7 @@ def needs_switch(session, quota, threshold):
     # An OpenAI login does not control a proxy provider's quota.
     if proxy_session(session): return False
     if session.get('status') == 'interrupted': return False
-    if session.get('waiting') or session.get('is_child') or session.get('goal_status') not in (None, 'active', 'usage_limited'): return False
+    if session.get('waiting') or session.get('is_child') or not recoverable_goal(session): return False
     # A user can resume a turn while the persisted Goal still says limited.
     # Keep that live turn working until fresh quota or a turn failure needs recovery.
     if session.get('goal_status') == 'usage_limited' and session.get('status') != 'running': return True
@@ -183,7 +206,7 @@ def needs_switch(session, quota, threshold):
         if session.get('_screen_quota'):
             return any(isinstance(quota.get(k), (int, float)) and quota[k] <= threshold for k in ('five_remaining', 'weekly_remaining'))
         return True
-    if session.get('status') != 'running': return False
+    if session.get('status') != 'running' and not (session.get('_continue_on_stop') and session.get('status')=='idle'): return False
     return any(isinstance(quota.get(k), (int, float)) and quota[k] <= threshold for k in ('five_remaining', 'weekly_remaining'))
 
 def choose_destination(accounts, app, outgoing, occupied, uncertain, threshold, five_hour_only=False):
@@ -212,7 +235,8 @@ def confirmed_interruptions(operation):
     if operation.get('phase') == 'desktop-close-intent':
         saved=operation.get('metadata',{}).get('originals',{})
     result=[dict(value,session=sid,account=operation.get('verified_interruption_accounts',{}).get(sid,operation.get('outgoing'))) for sid,value in saved.items()
-            if value.get('relay_interrupted') and value.get('goal') in (None,'active')]
+            if value.get('relay_interrupted') and (value.get('goal') in (None,'active') or
+                operation.get('recovery_context',{}).get(sid,{}).get('continue_on_stop') and value.get('goal') in ('blocked','complete','completed'))]
     if operation.get('phase')=='desktop-interrupt-confirmed':
         latest=operation.get('metadata',{})
         if latest.get('session') not in {r.get('session') for r in result}:result.append(latest)
@@ -221,7 +245,7 @@ def confirmed_interruptions(operation):
 def quota_failure_before_handoff(session, operations):
     kind=''.join(c for c in str(session.get('error_kind') or '').lower() if c.isalnum())
     started=session.get('_turn_started_at_ms')
-    if (session.get('status')!='failed' or session.get('goal_status') not in (None,'active') or
+    if (session.get('status')!='failed' or not recoverable_goal(session,False) or
         kind not in ('quota','usagelimitexceeded','ratelimitexceeded') or
         not isinstance(started,(int,float)) or started<=0):return False
     for op in operations:
@@ -245,7 +269,7 @@ def quota_failure_after_handoff(session, operation):
             or (not idle_usage_goal and (session.get('status')!='failed' or not recovery_error(session.get('error_kind'))))
             or session.get('account_key')!=operation.get('target')
             or session.get('waiting') or session.get('is_child') or proxy_session(session)
-            or session.get('goal_status') not in (None,'active','usage_limited')
+            or not recoverable_goal(session)
             or not session.get('turn_id')):
         return None
     if idle_usage_goal:
@@ -465,9 +489,10 @@ def desktop_startup_goal_preserved(before, row):
     old=before.get('goal_record');new=row.get('_goal_record')
     if old is None or new is None:
         return old is None and new is None and row.get('goal_status') is None
+    allowed=('active','usage_limited','blocked','complete','completed') if row.get('_continue_on_stop') else ('active','usage_limited')
     if (not all(DesktopAdapter._goal_accounting_valid(g) for g in (old,new))
-            or old.get('status') not in ('active','usage_limited')
-            or new.get('status') not in ('active','usage_limited')
+            or old.get('status') not in allowed
+            or new.get('status') not in allowed
             or row.get('goal_status')!=new.get('status') or old.get('deferred') or new.get('deferred')):
         return False
     return DesktopAdapter._goal_progress_preserved(dict(old,status=new['status']),new)
@@ -516,9 +541,9 @@ def desktop_restart_superseded_by_later_turns(operation, sessions, current_key):
         row=rows.get(sid);before=operation.get('recovery_context',{}).get(sid)
         if (not desktop_startup_row_verified(before,row,current_key)
                 or not desktop_startup_new_turn(operation,before,row)):return False
-        running=row.get('status')=='running' and row.get('goal_status') in (None,'active','usage_limited')
+        running=row.get('status')=='running' and recoverable_goal(row)
         failed=(row.get('status')=='failed' and recovery_error(row.get('error_kind'))
-                and not row.get('_screen_quota') and row.get('goal_status') in (None,'active','usage_limited'))
+                and not row.get('_screen_quota') and recoverable_goal(row))
         if not (running or failed):return False
     return True
 
@@ -590,6 +615,7 @@ class Controller:
         self.interruption_receipts = []
         self.completed_handoffs = []
         self.recovery_attempts = []
+        self.auto_continue=AutoContinue(LOCALDATA/'auto-continue.json')
         try:self.attach_retries=load_json(LOCALDATA/'desktop-attach-retries.json')
         except (OSError,ValueError):self.attach_retries={}
         if not isinstance(self.attach_retries,dict):self.attach_retries={}
@@ -702,6 +728,7 @@ class Controller:
         if phase in ('session-recovered','desktop-session-recovered'):
             recovered = self.journal.setdefault('recovered_sessions',[])
             if metadata['session'] not in recovered:recovered.append(metadata['session'])
+            self.journal.setdefault('recovered_at',{})[metadata['session']]=time.time()
         self.journal['metadata'] = metadata
         self.journal['updated_at'] = time.time()
         self.save_journal()
@@ -730,7 +757,7 @@ class Controller:
             if not before or not before.get('turn') or not before.get('settings'):return False
             goal=before.get('goal_record')
             if proxy_session(before.get('settings_snapshot') or {}):return False
-            if not desktop_startup_goal_preserved(before,{'_goal_record':goal,'goal_status':goal.get('status') if goal else None}):return False
+            if not desktop_startup_goal_preserved(before,{'_goal_record':goal,'goal_status':goal.get('status') if goal else None,'_continue_on_stop':before.get('continue_on_stop')}):return False
             if row:
                 # Missing ownership alone may be repaired by reopening. Other
                 # observed changes or a manual stop must remain protected.
@@ -910,9 +937,13 @@ class Controller:
             (s.get('status')=='running' or s.get('goal_status')=='usage_limited' or
              (s.get('status')=='failed' and recovery_error(s.get('error_kind')))) for s in rows)
             for app,rows in discovered.items())
+        self.keep_awake=self.keep_awake or bool(cfg.get('codex',{}).get('enabled')
+            and cfg.get('codex',{}).get('continue_on_stop') and not self.auto_continue.invalid and
+            any(row['id'] in cfg['codex'].get('sessions',[]) and stopped_chat(row) for row in discovered.get('codex',[])))
         active_keys = {s.get('account_key') for app, rows in discovered.items() if cfg.get(app, {}).get('enabled')
             for s in rows if s['id'] in cfg.get(app, {}).get('sessions', [])}
         self.active_keys=active_keys
+        self.auto_continue.reconcile(discovered.get('codex',[]),self.accounts.current_desktop_key())
         self.refresh_accounts(active_keys)
         self.publish(discovered, {app: self.attention.get(app, 'Checking selected chats and allowances') for app in self.adapters})
         for operation in self.interruption_receipts:
@@ -921,7 +952,7 @@ class Controller:
                 from desktop_adapter import DesktopAdapter
                 goal_matches=(not metadata.get('goal_record') or (row and DesktopAdapter._goal_progress_preserved(metadata['goal_record'],row.get('_goal_record'))))
                 if (row and row.get('status') == 'interrupted' and row.get('turn_id') == metadata.get('turn')
-                    and row.get('_settings_fingerprint') == metadata.get('settings') and row.get('goal_status') in (None,'active')
+                    and row.get('_settings_fingerprint') == metadata.get('settings') and recoverable_goal(row,False)
                     and goal_matches and not row.get('waiting') and row.get('account_key') == metadata.get('account')):
                     self.adapters['codex'].recovery_receipts[row['id']] = (row['turn_id'], row['_settings_fingerprint'])
         self.keep_awake=self.keep_awake or any(cfg.get(app,{}).get('enabled') and any(
@@ -932,6 +963,9 @@ class Controller:
         for operation in list(self.unresolved):
             app=operation['app'];phase=operation.get('phase');metadata=operation.get('metadata',{})
             safe=phase in ('prepare','desktop-recovery-context')
+            safe=safe or (app=='codex' and phase=='desktop-continuation-cancelled' and metadata.get('not_submitted') is True)
+            orca_superseded=orca_interrupt_superseded(operation,discovered.get(app,[])) if app=='orca' else False
+            safe=safe or orca_superseded
             failed_after_send=(orca_continuation_failed(operation,discovered.get(app,[])) if app=='orca' else
                 desktop_continuation_failed(operation,discovered.get(app,[]),self.accounts.current_desktop_key())
                 if app=='codex' and self.accounts.find(self.accounts.current_desktop_key()) is not None else False)
@@ -1066,7 +1100,7 @@ class Controller:
                         and desktop_startup_row_verified(before,row,current_key)
                         and row.get('status')=='interrupted' and row.get('turn_id')==metadata.get('turn')
                         and row.get('_settings_fingerprint')==metadata.get('settings')
-                        and row.get('goal_status') in (None,'active')):
+                        and recoverable_goal(row,False)):
                     self.adapters[app].recovery_receipts[row['id']] = (row['turn_id'],row['_settings_fingerprint'])
                     row['controller_interrupted']=True;safe=True
             if not safe and phase == 'desktop-close-intent' and app == 'codex' and self.accounts.current_desktop_key() == operation.get('outgoing'):
@@ -1081,12 +1115,15 @@ class Controller:
                         safe = False; break
                     if original and (row.get('turn_id') != original['turn'] or row.get('_settings_fingerprint') != original['settings'] or row.get('goal_status') != original['goal']):
                         safe = False; break
-                    if original and original.get('relay_interrupted') and row.get('status') == 'interrupted' and row.get('goal_status') in (None, 'active'):
+                    if original and original.get('relay_interrupted') and row.get('status') == 'interrupted' and recoverable_goal(row,False):
                         receipt = (row.get('turn_id'), row.get('_settings_fingerprint'))
                         self.adapters[app].recovery_receipts[sid] = receipt
                     if not (row.get('goal_status') == 'usage_limited' or (row.get('status') == 'interrupted' and receipt == (row.get('turn_id'), row.get('_settings_fingerprint')))):
                         safe = False; break
             if safe:
+                if orca_superseded:
+                    operation['reconciliation']='The original interrupt was superseded by verified newer turns in the same panes; no continuation replayed.'
+                    self.note('Orca: cleared an old interrupt failure after verifying newer native work; monitoring current turns.')
                 if app=='codex' and failed_after_send:
                     # The failure attestation also verified each unsent sibling.
                     # Rebind only unchanged relay pauses to the actual target.
@@ -1148,6 +1185,8 @@ class Controller:
                 messages[app] = self.attention[app]; continue
             selected = set(setting.get('sessions', []))
             blocked = {sid for op in self.unresolved if op['app'] == app for sid in op.get('sessions', []) if sid not in op.get('recovered_sessions',[])}
+            if app=='codex':blocked.update(self.auto_continue.pending_ids())
+            if app=='codex' and self.auto_continue.invalid:blocked.update(setting.get('sessions',[]))
             sessions = [s for s in discovered[app] if s['id'] in selected and s['id'] not in blocked]
             if not selected:
                 messages[app] = 'Select chats before enabling automation'; continue
@@ -1202,7 +1241,7 @@ class Controller:
                     current_quotas.get((outgoing, str(s.get('home') if app == 'orca' else REAL_HOME)), {})) for s in affected)
                 in_place=(app=='codex' and available(current_quotas.get((outgoing,str(REAL_HOME)),{}),threshold)
                     and all(quota_failure_before_handoff(s,self.completed_handoffs) or
-                        s.get('status')=='interrupted' and s.get('goal_status') in (None,'active') and
+                        s.get('status')=='interrupted' and recoverable_goal(s,False) and
                         getattr(adapter,'recovery_receipts',{}).get(s['id'])==(s.get('turn_id'),s.get('_settings_fingerprint'))
                         for s in affected))
                 try:
@@ -1222,7 +1261,7 @@ class Controller:
                 messages[app] = 'Checking available saved accounts'
                 self.publish(discovered, messages)
                 self.stage='checking available saved accounts'
-                uncertain.update(quota_failed_target_keys(app,affected,self.recovery_attempts,self.accounts.quotas))
+                uncertain.update(quota_failed_target_keys(app,affected,self.recovery_attempts+self.auto_continue.failures(),self.accounts.quotas))
                 # The background refresh owns inventory probes. Failed saved
                 # credentials must not stall every active chat for minutes.
                 if in_place:target,sharing=self.accounts.find(outgoing),False
@@ -1230,7 +1269,7 @@ class Controller:
                 if not target and not returning:
                     quota=next((q for (key,_),q in current_quotas.items() if key==outgoing),{})
                     if (outgoing not in uncertain and available(quota,threshold)
-                            and same_account_retry_allowed(app,affected,quota,self.recovery_attempts)):
+                            and same_account_retry_allowed(app,affected,quota,self.recovery_attempts+self.auto_continue.failures())):
                         target=self.accounts.find(outgoing)
                         in_place=app=='codex' and in_place_recovery_eligible(affected)
                 if returning and not target:
@@ -1306,6 +1345,11 @@ class Controller:
                     self.note(f'{app.title()}: recovery stopped for review.')
                 self.save_journal()
                 if app in self.attention and app != 'orca': break
+        blocked={sid for op in self.unresolved if op.get('app')=='codex' for sid in op.get('sessions',[])}
+        if self.auto_continue.drive(discovered.get('codex',[]),config().get('codex',{}),self.accounts,
+                self.adapters.get('codex'),threshold,blocked,available,self.recovery_attempts):
+            self.note('Codex: continued a stopped selected chat; monitoring without requiring a Goal.')
+            messages['codex']='Continued selected chat; monitoring'
         self.publish(discovered, messages)
         self.stage='waiting for next check'
         self.cycle_completed=time.time()

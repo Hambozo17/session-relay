@@ -15,6 +15,19 @@ def exited_pane(wait, terminal):
     return (isinstance(wait,dict) and wait.get('handle')==terminal and wait.get('condition')=='exit'
         and wait.get('satisfied') is True and wait.get('status')=='exited')
 
+def screen_quota(info, screen):
+    text='\n'.join(screen.get('tail',[])).lower()
+    matches=list(re.finditer(r"you(?:'|\u2019)?ve hit your usage limit|you have hit your usage limit|usage limit reached",text))
+    if (screen.get('source')=='screen' and info.get('status')!='interrupted' and info.get('turn_id')
+            and matches and matches[-1].start()>text.rfind('worked for ')):
+        info.update(status='failed',error_kind='quota',_screen_quota=True)
+
+def idle_tui(screen):
+    text='\n'.join(screen.get('tail',[]))
+    return bool(screen.get('source')=='screen' and not screen.get('draft')
+        and re.search(r'^\s*[\u203a>]\s*(?:Ask Codex\b|$)',text,re.M)
+        and not re.search(r'^[^A-Za-z0-9\n]*Working\s*\(',text,re.M))
+
 def shell_exit_confirmed(screen, sid, process=None, terminal=None, incarnation=None):
     text = '\n'.join(screen.get('tail', []))
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -114,15 +127,9 @@ class OrcaAdapter:
                 except (OSError, ValueError, StopIteration): continue
                 terminal = by_pty.get(tab.get('ptyId')) or {}
                 state = agent.get('state')
+                screen={}
                 if terminal.get('handle') and state in ('working','running','idle','done','error'):
                     screen=self.rpc.call('terminal.read', {'terminal':terminal['handle'],'screen':True,'limit':2500})['terminal']
-                    screen_text='\n'.join(screen.get('tail',[])).lower()
-                    limit_matches=list(re.finditer(r"you(?:'|’)?ve hit your usage limit|you have hit your usage limit|usage limit reached",screen_text))
-                    if info['status'] != 'interrupted' and info.get('turn_id') and limit_matches and limit_matches[-1].start()>screen_text.rfind('worked for '):
-                        # Screen errors do not contain turn IDs. Keep the transcript's
-                        # stop authoritative and require fresh exhausted quota in the
-                        # controller before this supplemental evidence can rotate.
-                        info.update(status='failed',error_kind='quota',_screen_quota=True);state='error'
                 waiting = state in ('waiting', 'permission', 'asking', 'approval', 'needs-input')
                 if state in ('working', 'running') and info['status'] not in ('interrupted','failed'): info['status'] = 'running'
                 if state in ('idle', 'done') and info['status'] == 'running': info['status'] = 'idle'
@@ -160,6 +167,10 @@ class OrcaAdapter:
                         if time.time()-binding.get('verified_at',0)<60:
                             info.update(status='unknown',reserved_keys=[info['account_key'],binding['key']])
                         else:self.bindings.pop(info['id'], None)
+                # Resolve the managed transcript before applying supplemental
+                # screen evidence; its binding must not erase a limit banner.
+                # Recovery still requires a freshly depleted allowance.
+                screen_quota(info,screen)
         # A resumed idle TUI may not publish a provider hook until its next turn.
         # Retain only a binding attested by local /status in this exact pane.
         known = {s['id'] for s in found}
@@ -176,9 +187,10 @@ class OrcaAdapter:
                     'expectedIncarnationId':binding['incarnation'],'screen':True,'limit':3500})['terminal']
                 text='\n'.join(screen.get('tail',[]))
                 goal=read_goal(home,sid)
+                screen_quota(info,screen)
                 ready=(terminal.get('connected') and screen.get('source')=='screen'
                     and 'conversation is open in another app' not in text.lower()
-                    and any(marker in text for marker in ('Ask Codex','Working')))
+                    and (info.get('_screen_quota') or any(marker in text for marker in ('Ask Codex','Working'))))
                 if ready:
                     native=self.rpc.call('terminal.agentStatus',{'terminal':terminal['handle']}).get('agentStatus') or {}
                     state=native.get('status') or native.get('state')
@@ -200,6 +212,7 @@ class OrcaAdapter:
                     pty_id=terminal.get('ptyId'),terminal=terminal['handle'],incarnation=binding['incarnation'],
                     connected=bool(terminal.get('connected')),supported=True,agent_state=state,
                     _goal={k:goal.get(k) for k in ('goal_id','status','token_budget','tokens_used','time_used_seconds','updated_at_ms')} if goal else None)
+                screen_quota(info,screen)
                 found.append(info)
             except (OSError,ValueError):continue
         return found
@@ -356,10 +369,20 @@ class OrcaAdapter:
                     state = self.rpc.call('terminal.agentStatus', {'terminal': fresh['terminal']}).get('agentStatus') or {}
                     native = state.get('status') or state
                     native_state = native if isinstance(native, str) else native.get('state')
-                    stopped = read_transcript(fresh['path'])['status'] != 'running'
-                    if stopped and native_state not in ('working', 'running'): break
+                    stopped_info=read_transcript(fresh['path'])
+                    if stopped_info.get('turn_id')!=original.get('turn_id'):
+                        raise RuntimeError('A newer turn started while recovery was stopping the original')
+                    stopped=stopped_info['status']!='running'
+                    if stopped and native_state not in ('working', 'running'):break
+                    if stopped:
+                        screen=self.rpc.call('terminal.read',{'terminal':fresh['terminal'],
+                            'expectedIncarnationId':fresh['incarnation'],'screen':True,'limit':2500})['terminal']
+                        if idle_tui(screen):break
                 else: raise RuntimeError('The running turn did not stop cleanly')
                 stopped_info = read_transcript(fresh['path'])
+                if (stopped_info.get('turn_id')!=original.get('turn_id')
+                        or stopped_info.get('status') not in ('interrupted','idle','failed')):
+                    raise RuntimeError('The original stopped turn changed before recovery could continue')
                 stop_receipt = (stopped_info.get('turn_id'), stopped_info.get('event_pos'))
             if original.get('goal_status') in ('active','usage_limited'):
                 current_goal = read_goal(original['home'], sid)
@@ -374,6 +397,10 @@ class OrcaAdapter:
                 pause_receipt=read_goal(original['home'],sid)
             # Keep the shell and pane alive. Hibernating its PTY lets Orca's renderer
             # wake the old process automatically, which can race a replacement.
+            current=read_transcript(fresh['path'])
+            if current.get('turn_id')!=original.get('turn_id') or stop_receipt and (
+                    current.get('status')=='running' or current.get('event_pos')!=stop_receipt[1]):
+                raise RuntimeError('A newer turn or stop changed the original chat before quitting')
             journal('quit-codex', {'session': sid, 'terminal': fresh['terminal']})
             if fresh.get('_exited_pane'):
                 exit_kind='exited'
